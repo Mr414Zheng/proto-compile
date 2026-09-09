@@ -14,7 +14,7 @@ from proto_tool.cli import output_transaction
 from proto_tool.extract import Source, extract, safe_name
 from proto_tool.normalize import normalize
 from proto_tool.repairs import repair_sources
-from proto_tool.toolchain import INSTALL, find_protoc, unpack, verify_archive
+from proto_tool.toolchain import INSTALL, VERSION, RUNTIME_VERSION, find_protoc, unpack, verify_archive
 
 ROOT = Path(__file__).resolve().parent.parent
 PROTOC = INSTALL / 'bin' / 'protoc'
@@ -139,6 +139,12 @@ class NormalizationTests(unittest.TestCase):
         normalized, _ = normalize(sources(**{'a.proto': 'message A {}'}), 'com.example')
         self.assertIn('option java_package = "com.example.a";', normalized['a.proto'].text)
 
+    def test_no_java_package_keeps_proto_namespace(self):
+        normalized, changes = normalize(sources(**{'a.proto': 'message A {}'}), '')
+        self.assertIn('option java_package = "";', normalized['a.proto'].text)
+        self.assertIn('package device_protocol.a;', normalized['a.proto'].text)
+        self.assertEqual(changes[0]['java_package'], '')
+
 
 class SafetyTests(unittest.TestCase):
     def test_publication_and_failure(self):
@@ -237,7 +243,8 @@ class CompileTests(unittest.TestCase):
         (source / 'b.proto').write_text('syntax="proto2"; import "a.proto"; message B { optional A a=1; }')
         result = self.call(source, '-o', self.root / 'directory')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads((self.root / 'directory/report.json').read_text())['proto_count'], 2)
+        self.assertEqual(len(list((self.root / 'directory/proto').glob('*.proto'))), 2)
+        self.assertEqual({p.name for p in (self.root / 'directory').iterdir()}, {'java', 'proto'})
 
     def test_multiple_include_roots(self):
         roots = [self.root / str(i) for i in range(3)]
@@ -264,20 +271,33 @@ class CompileTests(unittest.TestCase):
         source.write_text('<div title="枚举"><pre>' + html.escape(body) + '</pre></div>')
         result = self.call(source, '-o', self.root / 'out', '--java-package', 'com.example')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('default=A_SAME', (self.root / 'out/normalized/a.proto').read_text())
-        self.assertIn('default=SAME', (self.root / 'out/original/a.proto').read_text())
+        self.assertIn('default=A_SAME', (self.root / 'out/proto/a.proto').read_text())
+        self.assertFalse((self.root / 'out/original').exists())
 
     def test_document_excluding_opt_0081(self):
-        result = self.call(ROOT / 'device protocol v16.2.html', '-o', self.root / 'out', '--exclude-opt', 'OPT_0081')
+        result = self.call(ROOT / 'device protocol v16.2.html', '-o', self.root / 'out')
         self.assertEqual(result.returncode, 0, result.stderr)
-        report = json.loads((self.root / 'out/report.json').read_text())
-        self.assertEqual(report['proto_count'], 57)
-        self.assertEqual(report['java_count'], 57)
-        self.assertEqual(report['excluded'][0]['file'], 'his_encrypt_data.proto')
-        self.assertTrue((self.root / 'out/original/his_encrypt_data.proto').exists())
-        self.assertFalse((self.root / 'out/normalized/his_encrypt_data.proto').exists())
-        self.assertFalse((self.root / 'out/java/device/protocol/his_encrypt_data').exists())
-        self.assertTrue((self.root / 'out/normalized/his_encrypt_health_data.proto').exists())
+        self.assertEqual({p.name for p in (self.root / 'out').iterdir()}, {'java', 'proto'})
+        self.assertEqual(len(list((self.root / 'out/proto').glob('*.proto'))), 57)
+        generated = list((self.root / 'out/java').glob('*.java'))
+        self.assertEqual(len(generated), 57)
+        self.assertIn('libprotoc ' + VERSION, result.stdout)
+        self.assertIn('com.google.protobuf:protobuf-java:' + RUNTIME_VERSION, result.stdout)
+        self.assertFalse((self.root / 'out/proto/his_encrypt_data.proto').exists())
+        self.assertTrue((self.root / 'out/proto/his_encrypt_health_data.proto').exists())
+        self.assertTrue(all('device.protocol.' not in p.read_text() for p in generated))
+
+    def test_default_compiler_and_legacy_runtime_output(self):
+        compiler, version = find_protoc()
+        self.assertEqual(compiler, PROTOC.resolve())
+        self.assertEqual(version, 'libprotoc 3.11.0')
+        source = self.root / 'sample.proto'
+        source.write_text('syntax="proto2"; message Sample { optional int32 value=1; }')
+        result = self.call(source, '-o', self.root / 'out')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = next((self.root / 'out/java').glob('*.java')).read_text()
+        self.assertNotIn('com.google.protobuf.GeneratedFile', generated)
+        self.assertNotIn('com.google.protobuf.RuntimeVersion', generated)
 
     def test_exclusion_is_html_only(self):
         source = self.root / 'a.proto'
@@ -286,6 +306,34 @@ class CompileTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('仅用于 HTML', result.stderr)
         self.assertFalse((self.root / 'out').exists())
+
+    def test_document_without_java_package(self):
+        result = self.call(ROOT / 'device protocol v16.2.html', '-o', self.root / 'out',
+                           '--exclude-opt', 'OPT_0081', '--no-java-package')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = list((self.root / 'out/java').glob('*.java'))
+        self.assertEqual(len(generated), 57)
+        for source in generated:
+            text = source.read_text()
+            self.assertNotIn('device.protocol.', text)
+            self.assertNotRegex(text, r'(?m)^\s*package\s+')
+        self.assertIn('RealtimeData.', (self.root / 'out/java/DeviceConf.java').read_text())
+
+    def test_default_output_and_extract_are_clean(self):
+        document = ROOT / 'device protocol v16.2.html'
+        result = subprocess.run([sys.executable, str(ROOT / 'proto_compile.py'), 'compile', str(document)],
+                                cwd=self.root, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({p.name for p in (self.root / 'output').iterdir()}, {'java', 'proto'})
+        self.assertTrue(all(p.suffix in ('.java', '.proto') for p in (self.root / 'output').rglob('*') if p.is_file()))
+        extraction = self.root / 'extract-run'
+        extraction.mkdir()
+        result = subprocess.run([sys.executable, str(ROOT / 'proto_compile.py'), 'extract', str(document)],
+                                cwd=extraction, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        extracted = list((extraction / 'output/proto').iterdir())
+        self.assertEqual(len(extracted), 57)
+        self.assertTrue(all(p.suffix == '.proto' for p in extracted))
 
 
 if __name__ == '__main__':

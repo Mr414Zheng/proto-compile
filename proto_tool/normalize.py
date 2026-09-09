@@ -200,7 +200,8 @@ def validate_java_package(value):
 
 
 def normalize(sources, java_package='device.protocol'):
-    validate_java_package(java_package)
+    if java_package:
+        validate_java_package(java_package)
     schemas = {name: Schema(source) for name, source in sources.items() if name.endswith('.proto')}
     keys = {name: namespace_key(name) for name in schemas}
     if len(set(keys.values())) != len(keys):
@@ -285,7 +286,8 @@ def normalize(sources, java_package='device.protocol'):
     result = {}
     for name, schema in schemas.items():
         package = 'device_protocol.' + keys[name]
-        java = java_package + '.' + keys[name]
+        # 显式空 Java 包覆盖 proto package，保留协议命名空间来隔离同名类型。
+        java = java_package + '.' + keys[name] if java_package else ''
         declaration = f'\npackage {package};\noption java_package = "{java}";\n'
         if schema.package_span:
             schema.edits.append((*schema.package_span, ''))

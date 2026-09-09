@@ -14,12 +14,14 @@ from .extract import safe_name
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = '33.5'
-RUNTIME_VERSION = '4.33.5'
+VERSION = '3.11.0'
+RUNTIME_VERSION = '3.11.0'
 INSTALL = ROOT / '.tools' / ('protoc-' + VERSION)
+# 3.11.0 没有 macOS ARM 包；Apple Silicon 通过 Rosetta 运行同一 Intel 包。
+# 此旧版发布页没有提供摘要，以下 SHA-256 固定自官方 HTTPS 下载的安装包。
 ASSETS = {
-    'arm64': ('osx-aarch_64', '7084c6482e3bb416a33fe2162ba566711773b842e6953bf6cb181647b9ef57c0'),
-    'x86_64': ('osx-x86_64', '7f31625f8bec4929082ae9209e101c1c03692624457cc6332f83736db495ee92'),
+    'arm64': ('osx-x86_64', 'd35dfbb430cd242eb0405557c7e189c68abb1d85b11674bf8b302ed6c6360646'),
+    'x86_64': ('osx-x86_64', 'd35dfbb430cd242eb0405557c7e189c68abb1d85b11674bf8b302ed6c6360646'),
 }
 
 
