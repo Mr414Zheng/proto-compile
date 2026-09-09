@@ -1,0 +1,10 @@
+# 系统文件与 Python 本地缓存
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# 可重新下载的工具链及可重新生成的编译产物
+.tools/
+output/

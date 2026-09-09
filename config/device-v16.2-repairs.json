@@ -1,0 +1,7 @@
+{
+  "device_Configure_info.proto": {
+    "sha256": "ecd78f880b11fa371e7b07d48a8c0ca32e9c810e5c46f7360969d463171fef10",
+    "add_imports": ["yyl_info.proto"],
+    "reason": "yyl_report_type 和 yyl_body_report 仅在 yyl_info.proto 中声明，原文缺少 import。"
+  }
+}
