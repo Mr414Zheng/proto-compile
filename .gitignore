@@ -13,6 +13,8 @@ __pycache__/
 *.options
 *.java
 !tests/JavaSmoke.java
+*.pbobjc.h
+*.pbobjc.m
 /private-inputs/
 
 # 本地凭据与签名私钥。

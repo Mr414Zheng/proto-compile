@@ -134,8 +134,8 @@ class NormalizationTests(unittest.TestCase):
                            'b.proto': 'import public "a.proto"; message B { optional A a=1; }',
                            'c.proto': 'import "a.proto"; message C { optional B b=1; }'})
         references = []
-        def tracked(source):
-            schema = Schema(source)
+        def tracked(source, **kwargs):
+            schema = Schema(source, **kwargs)
             references.append(weakref.ref(schema))
             return schema
         enabled = gc.isenabled()
@@ -219,6 +219,29 @@ class NormalizationTests(unittest.TestCase):
         self.assertIn('option java_package = "";', normalized['a.proto'].text)
         self.assertIn('package device_protocol.a;', normalized['a.proto'].text)
         self.assertEqual(changes[0]['java_package'], '')
+
+    def test_objc_prefixes_are_stable_unique_and_preserve_explicit_options(self):
+        items = sources(**{'a.proto': 'package a; enum State { OK=0; } message Shared {}',
+                           'b.proto': 'package b; import "a.proto"; message Shared {optional a.Shared peer=1;}',
+                           'custom.proto': 'option objc_class_prefix="USR"; message Shared {}'})
+        normalized, _ = normalize(items, output_language='objc')
+        again, _ = normalize(dict(reversed(list(items.items()))), output_language='objc')
+        self.assertEqual({k: v.text for k, v in normalized.items()}, {k: v.text for k, v in again.items()})
+        for name, prefix in (('a.proto', 'PCTa_'), ('b.proto', 'PCTb_'), ('custom.proto', 'USR')):
+            self.assertIn(f'option objc_class_prefix = "{prefix}";' if prefix != 'USR' else 'option objc_class_prefix="USR";', normalized[name].text)
+            self.assertEqual(normalized[name].text.count('objc_class_prefix'), 1)
+            self.assertNotIn('java_package', normalized[name].text)
+        self.assertIn('.device_protocol.a.Shared peer', normalized['b.proto'].text)
+
+    def test_objc_option_handling_preserves_protoc_diagnostics(self):
+        item = sources(**{'a.proto': 'option objc_class_prefix=""; option java_package="old"; message A {}'})
+        normalized, _ = normalize(item, output_language='objc')
+        self.assertIn('option objc_class_prefix="";', normalized['a.proto'].text)
+        self.assertNotIn('PCTa_', normalized['a.proto'].text)
+        with self.assertRaisesRegex(ProtoError, '已有 java_'):
+            normalize(item)
+        with self.assertRaisesRegex(ProtoError, '输出语言'):
+            normalize(item, output_language='swift')
 
 
 class SafetyTests(unittest.TestCase):

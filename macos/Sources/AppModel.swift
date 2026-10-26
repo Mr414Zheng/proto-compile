@@ -10,11 +10,21 @@ final class AppModel: ObservableObject {
     enum TargetRuntime: String, CaseIterable {
         case current = "3.25.9"
         case compatible = "3.6.1"
-        var label: String { self == .current ? "protobuf-java 3.25.9（默认）" : "兼容 protobuf-java 3.6.1" }
-        var dependency: String { "com.google.protobuf:protobuf-java:\(rawValue)" }
+        func label(for language: OutputLanguage) -> String {
+            self == .current ? "\(language.runtimeName) 3.25.9（默认）" : "兼容 \(language.runtimeName) 3.6.1"
+        }
+        func dependency(for language: OutputLanguage) -> String {
+            language == .java ? "com.google.protobuf:protobuf-java:\(rawValue)" : "pod 'Protobuf', '\(rawValue)'"
+        }
         var expectedCompilerVersion: String { self == .current ? "libprotoc 25.9" : "libprotoc 3.6.1" }
     }
+    enum OutputLanguage: String, CaseIterable {
+        case java, objc
+        var label: String { self == .java ? "Java" : "Objective-C" }
+        var runtimeName: String { self == .java ? "protobuf-java" : "Protobuf Objective-C" }
+    }
     @Published var targetRuntime: TargetRuntime = .current
+    @Published private(set) var outputLanguage: OutputLanguage = .java
     @Published var inputKind: InputKind = .html
     @Published var inputPaths: [String] = []
     @Published var includePaths: [String] = []
@@ -118,7 +128,13 @@ final class AppModel: ObservableObject {
 
     func copyDependency() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(targetRuntime.dependency, forType: .string)
+        NSPasteboard.general.setString(targetRuntime.dependency(for: outputLanguage), forType: .string)
+    }
+
+    func setOutputLanguage(_ language: OutputLanguage) {
+        guard !busy, outputLanguage != language else { return }
+        outputLanguage = language
+        parametersChanged()
     }
 
     func setKind(_ kind: InputKind) {
@@ -227,7 +243,7 @@ final class AppModel: ObservableObject {
     private func makeRequest(action: String, id: String) -> EngineRequest {
         var request = EngineRequest(task_id: id, action: action, input_kind: inputKind.rawValue,
                       input_paths: inputPaths, include_paths: includePaths,
-                      output_parent: outputParent, exclude_opt_0081: excludeOPT0081, target_runtime: targetRuntime.rawValue)
+                      output_parent: outputParent, exclude_opt_0081: excludeOPT0081, target_runtime: targetRuntime.rawValue, output_language: outputLanguage.rawValue)
         if action == "inspect" { request.preparation_output = preparationByRun[id]?.path }
         if action == "convert" { request.preparation_path = inspection?.preparation_path }
         return request
@@ -258,7 +274,7 @@ final class AppModel: ObservableObject {
         }, event: { [weak self] message in
             Task { @MainActor in
                 guard let self, self.activeID == id, !self.isCancelling else { return }
-                let names = ["reading": "读取文件", "parsing": "解析协议", "validating": "校验 Proto", "generating": "生成 Java", "exporting": "导出结果"]
+                let names = ["reading": "读取文件", "parsing": "解析协议", "validating": "校验 Proto", "generating": "生成 \(self.outputLanguage.label)", "exporting": "导出结果"]
                 self.stage = names[message.stage ?? ""] ?? "正在处理"
                 self.stageDetail = message.message_zh ?? ""
                 if let processed = message.processed, let total = message.total, total > 0 {
@@ -308,7 +324,8 @@ final class AppModel: ObservableObject {
                         } else {
                             self.result = message
                             self.stage = "转换完成"
-                            self.stageDetail = "已导出 \(message.proto_count ?? 0) 个 Proto、\(message.java_count ?? 0) 个 Java 文件。"
+                            let language = OutputLanguage(rawValue: message.resolvedOutputLanguage) ?? self.outputLanguage
+                            self.stageDetail = "已导出 \(message.proto_count ?? 0) 个 Proto、\(message.generatedFileCount) 个 \(language.label) 文件。"
                         }
                     }
                 case .failure(let failure):
@@ -370,19 +387,22 @@ final class AppModel: ObservableObject {
     func preview(_ state: String) {
         if let runtime = ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_RUNTIME"],
            let selected = TargetRuntime(rawValue: runtime) { targetRuntime = selected }
+        if let language = ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_LANGUAGE"],
+           let selected = OutputLanguage(rawValue: language) { outputLanguage = selected }
         compilerVersion = "预览模式"
         if state == "empty" { return }
         inputKind = .proto
         inputPaths = ["/Users/developer/Protocols/device.proto"]
         includePaths = ["/Users/developer/Protocols/common"]
         outputParent = "/Users/developer/Exports"
-        inspection = EngineMessage(protocol_version: 1, task_id: "preview", type: "result", proto_count: 12, java_count: 0, runtime_version: targetRuntime.rawValue, warnings: [], excluded: ["OPT0081.proto"], source_files: inputPaths)
+        inspection = EngineMessage(protocol_version: 1, task_id: "preview", type: "result", proto_count: 12, java_count: 0, output_language: outputLanguage.rawValue, objc_count: 0, generated_count: 0, runtime_version: targetRuntime.rawValue, warnings: [], excluded: ["OPT0081.proto"], source_files: inputPaths)
         stage = "输入检查通过"
         stageDetail = "准备就绪，可以开始转换。"
         if state == "success" {
-            result = EngineMessage(protocol_version: 1, task_id: "preview", type: "result", output_path: "/Users/developer/Exports/ProtoCompile-20261026", proto_count: 12, java_count: 36, runtime_version: targetRuntime.rawValue, warnings: [], changes: (0..<max(1, min(2000, Int(ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_RECORD_COUNT"] ?? "1") ?? 1))).map { "处理记录 \($0 + 1)：已生成 Java 源文件" }, excluded: ["OPT0081.proto"], source_files: inputPaths)
+            let generatedCount = outputLanguage == .java ? 36 : 24
+            result = EngineMessage(protocol_version: 1, task_id: "preview", type: "result", output_path: "/Users/developer/Exports/ProtoCompile-20261026", proto_count: 12, java_count: outputLanguage == .java ? generatedCount : 0, output_language: outputLanguage.rawValue, objc_count: outputLanguage == .objc ? generatedCount : 0, generated_count: generatedCount, runtime_version: targetRuntime.rawValue, warnings: [], changes: (0..<max(1, min(2000, Int(ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_RECORD_COUNT"] ?? "1") ?? 1))).map { "处理记录 \($0 + 1)：已生成 \(outputLanguage.label) 源文件" }, excluded: ["OPT0081.proto"], source_files: inputPaths)
             stage = "转换完成"
-            stageDetail = "已导出 12 个 Proto、36 个 Java 文件。"
+            stageDetail = "已导出 12 个 Proto、\(generatedCount) 个 \(outputLanguage.label) 文件。"
         }
         if state == "error" {
             inspection = nil

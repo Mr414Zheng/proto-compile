@@ -23,6 +23,7 @@ from .toolchain import RUNTIME_VERSION, TARGET_RUNTIMES, find_protoc, run
 
 JAVA_BATCH_FILES = 10
 JAVA_BATCH_SOURCE_BYTES = 32 * 1024
+OUTPUT_LANGUAGES = ('java', 'objc')
 
 
 class ConversionError(ProtoError):
@@ -106,6 +107,7 @@ class ConversionRequest:
     target_runtime: str = RUNTIME_VERSION
     preparation_output: object = None
     preparation_path: object = None
+    output_language: str = 'java'
 
 
 @dataclass
@@ -120,6 +122,9 @@ class ConversionResult:
     excluded: list = field(default_factory=list)
     source_files: list = field(default_factory=list)
     preparation_path: object = None
+    output_language: str = 'java'
+    objc_count: int = 0
+    generated_count: int = 0
 
 
 def describe_change(change):
@@ -132,7 +137,7 @@ def describe_change(change):
     return f'{change["file"]}: {label} {change.get("from", "")} → {change.get("to", "")}'
 
 
-def prepare_html(path, *, exclude_opt_0081=True, java_package='', repairs=None, no_repairs=False):
+def prepare_html(path, *, exclude_opt_0081=True, java_package='', repairs=None, no_repairs=False, output_language='java'):
     sources = extract(path)
     selected = {name: item for name, item in sources.items() if name.endswith('.proto')}
     excluded = []
@@ -143,7 +148,7 @@ def prepare_html(path, *, exclude_opt_0081=True, java_package='', repairs=None, 
     warnings = []
     repaired, repair_changes = (selected, []) if no_repairs else repair_sources(
         selected, repairs or DEFAULT_REPAIRS, strict=bool(repairs), warnings=warnings)
-    normalized, changes = normalize(repaired, java_package)
+    normalized, changes = normalize(repaired, java_package, output_language=output_language)
     return sources, normalized, warnings, [describe_change(c) for c in repair_changes + changes], excluded
 
 
@@ -235,7 +240,7 @@ def collect_proto_files(files, includes, protoc, cancellation=None, observed=Non
     return logical, roots
 
 
-def compile_files(protoc, files, includes, java, proto_output=None, cancellation=None):
+def compile_files(protoc, files, includes, java, proto_output=None, cancellation=None, output_language='java'):
     logical, roots = collect_proto_files(files, includes, protoc, cancellation)
     java.mkdir(parents=True, exist_ok=True)
     if proto_output is not None:
@@ -244,20 +249,25 @@ def compile_files(protoc, files, includes, java, proto_output=None, cancellation
             target = proto_output / safe_name(name)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
-    return _compile_collected(protoc, logical, roots, java, cancellation)
+    return _compile_collected(protoc, logical, roots, java, cancellation, output_language=output_language)
 
 
-def _compile_collected(protoc, logical, roots, java, cancellation=None):
+def _compile_collected(protoc, logical, roots, java, cancellation=None, output_language='java'):
     """依赖已由服务校验，直接生成，避免重复读取与路径解析。"""
+    if output_language not in OUTPUT_LANGUAGES:
+        raise ConversionError('输出语言必须为 Java 或 Objective-C。', 'INVALID_REQUEST')
     java.mkdir(parents=True, exist_ok=True)
     files = [logical[name] for name in sorted(logical)]
     common = [protoc] + [f'-I{root}' for root in roots]
-    command = common + [f'--java_out={java}'] + list(map(str, files))
+    command = common + [f'--{output_language}_out={java}'] + list(map(str, files))
     sizes = [path.stat().st_size for path in files]
     if len(files) <= JAVA_BATCH_FILES or sum(sizes) <= JAVA_BATCH_SOURCE_BYTES:
-        return run(command, cwd=roots[0], cancellation=cancellation)
+        result = run(command, cwd=roots[0], cancellation=cancellation)
+        if output_language == 'objc':
+            _validate_objc_symbols(java, cancellation)
+        return result
     token = cancellation or CancellationToken()
-    # protoc 在写盘前累积所有 Java 正文；限制每批入口数和源文本量，降低生成正文峰值。
+    # protoc 在写盘前累积生成正文；限制每批入口数和源文本量，降低生成正文峰值。
     # 单份大型协议无法据此拆小，仍交由同一原生生成器完整处理。
     batches, batch, volume = [], [], 0
     for path, size in zip(files, sizes):
@@ -280,7 +290,7 @@ def _compile_collected(protoc, logical, roots, java, cancellation=None):
 
         def generator_diagnostics(text):
             # 旧编译器按当前入口集合推断 unused import，分批可能产生全量编译没有的警告。
-            # 输入文件的解析警告统一使用全量校验结果；Java 后端的原生日志仍完整保留。
+            # 输入文件的解析警告统一使用全量校验结果；目标语言后端的原生日志仍完整保留。
             return [line for line in text.splitlines() if line not in parse_warnings
                     and not re.search(r'\.proto:(?:\d+(?::\d+)?:)?\s*warning:', line, re.IGNORECASE)]
 
@@ -289,7 +299,7 @@ def _compile_collected(protoc, logical, roots, java, cancellation=None):
             target = temp / str(index)
             target.mkdir()
             try:
-                result = run(common + [f'--java_out={target}'] + list(map(str, files_in_batch)),
+                result = run(common + [f'--{output_language}_out={target}'] + list(map(str, files_in_batch)),
                              cwd=roots[0], cancellation=token)
             except ProtoError as exc:
                 if isinstance(exc, Cancelled):
@@ -313,6 +323,8 @@ def _compile_collected(protoc, logical, roots, java, cancellation=None):
         if collisions:
             details = '\n'.join(warnings + collisions)
             raise ProtoError(f'命令失败 (1): {protoc}\n{details}')
+        if output_language == 'objc':
+            _validate_objc_symbols(temp, token)
         # 各批输出隔离且完整通过后才合并；同名文件即使内容一致也按原生规则拒绝。
         for relative, source in outputs.items():
             token.check()
@@ -321,6 +333,22 @@ def _compile_collected(protoc, logical, roots, java, cancellation=None):
             os.replace(source, destination)
         stderr = '\n'.join(warnings) + ('\n' if warnings else '')
         return subprocess.CompletedProcess(command, 0, ''.join(stdout), stderr)
+
+
+def _validate_objc_symbols(output, cancellation=None):
+    """Objective-C 没有 proto 包命名空间，拒绝生成器未报错的跨文件公开符号冲突。"""
+    declarations = re.compile(r'^\s*(?:GPB_FINAL\s+)?@interface\s+(\w+)\s*:|^\s*typedef\s+GPB_ENUM\(\s*(\w+)\s*\)', re.MULTILINE)
+    symbols = {}
+    for path in sorted(output.rglob('*.pbobjc.h')):
+        if cancellation:
+            cancellation.check()
+        for match in declarations.finditer(path.read_text(encoding='utf-8')):
+            name = match[1] or match[2]
+            previous = symbols.get(name)
+            if previous is not None:
+                raise ProtoError(f'Objective-C 符号冲突: {name} ({previous.relative_to(output)} 与 {path.relative_to(output)})；'
+                                 '请为源协议设置不同的 option objc_class_prefix')
+            symbols[name] = path
 
 
 def _check_destination(destination):
@@ -405,7 +433,7 @@ def _cached_result(request, snapshot, staged, token):
         return ConversionResult(output_path=None, **fields)
     except (prepared.InvalidPreparation, OSError, UnicodeError, ValueError, TypeError):
         # 缓存不可用时重新校验和生成；取消异常不在此捕获，继续向上传播。
-        for name in ('java', 'proto'):
+        for name in ('java', 'objc', 'proto'):
             path = staged / name
             if path.exists():
                 shutil.rmtree(path)
@@ -425,11 +453,14 @@ def convert(request, event=None, cancellation=None):
     if request.input_kind not in ('html', 'proto') or request.action not in ('inspect', 'convert', 'version'):
         raise ConversionError('不支持的输入类型或操作。', 'INVALID_REQUEST')
     if request.target_runtime not in TARGET_RUNTIMES:
-        raise ConversionError('不支持的 Java 运行库版本，请选择 3.25.9 或 3.6.1。', 'INVALID_REQUEST')
+        raise ConversionError('不支持的运行库版本，请选择 3.25.9 或 3.6.1。', 'INVALID_REQUEST')
+    if request.output_language not in OUTPUT_LANGUAGES:
+        raise ConversionError('输出语言必须为 Java 或 Objective-C。', 'INVALID_REQUEST')
+    language_label = 'Java' if request.output_language == 'java' else 'Objective-C'
     preparation_target = _preparation_target(request)
     if request.action == 'version':
         _, version = find_protoc(request.protoc, cancellation=token, target_runtime=request.target_runtime)
-        return ConversionResult(None, 0, 0, version, request.target_runtime)
+        return ConversionResult(None, 0, 0, version, request.target_runtime, output_language=request.output_language)
     progress('reading', '正在读取输入文件')
     inputs = [Path(p).expanduser().resolve() for p in request.input_paths]
     if not inputs:
@@ -479,8 +510,9 @@ def convert(request, event=None, cancellation=None):
         progress('validating', '正在校验协议与依赖')
         result = _cached_result(request, snapshot, staged, token) if request.preparation_path else None
         if result is not None and not _unchanged(snapshot, request, inputs, protoc, version, token, (Path(temp),)):
-            for name in ('java', 'proto'):
-                shutil.rmtree(staged / name)
+            for name in ('java', 'objc', 'proto'):
+                if (staged / name).exists():
+                    shutil.rmtree(staged / name)
             result = None
         if result is not None:
             progress('generating', '已校验并复用预检生成成果', processed=result.proto_count, total=result.proto_count)
@@ -488,7 +520,7 @@ def convert(request, event=None, cancellation=None):
             if request.input_kind == 'html':
                 sources, normalized, warnings, changes, excluded = prepare_html(
                     inputs[0], exclude_opt_0081=request.exclude_opt_0081, java_package=request.java_package,
-                    repairs=request.repairs, no_repairs=request.no_repairs)
+                    repairs=request.repairs, no_repairs=request.no_repairs, output_language=request.output_language)
                 write_sources(normalized, staged / 'proto')
                 files = [(staged / 'proto' / name).resolve() for name in normalized]
                 logical, roots = collect_proto_files(files, [staged / 'proto'], protoc, token)
@@ -496,22 +528,28 @@ def convert(request, event=None, cancellation=None):
             else:
                 source_files = [str(logical[name]) for name in sorted(logical)]
                 write_sources({name: Source(name, contents[path]) for name, path in logical.items()}, staged / 'proto')
-            progress('generating', '正在生成 Java 源码', processed=0, total=len(logical))
+            progress('generating', f'正在生成 {language_label} 源码', processed=0, total=len(logical))
             try:
-                generated = _compile_collected(protoc, logical, roots, staged / 'java', token)
+                generated = _compile_collected(protoc, logical, roots, staged / request.output_language, token,
+                                               output_language=request.output_language)
             except ProtoError as exc:
                 if isinstance(exc, Cancelled):
                     raise
                 diagnostic = str(exc).replace(str(staged) + '/', '')
                 match = re.search(r'([^\n:]+\.proto):(\d+)(?::\d+)?:', diagnostic)
-                raise ConversionError('协议校验或 Java 生成失败，请检查错误详情。', 'COMPILATION_FAILED',
+                raise ConversionError(f'协议校验或 {language_label} 生成失败，请检查错误详情。', 'COMPILATION_FAILED',
                                       file=match[1] if match else None, line=int(match[2]) if match else None,
                                       details=diagnostic) from exc
             compiler_warnings = generated.stderr.strip().replace(str(staged) + '/', '')
             if compiler_warnings:
                 warnings.append('编译器警告：\n' + compiler_warnings)
-            result = ConversionResult(None, len(logical), len(list((staged / 'java').rglob('*.java'))),
-                                      version, request.target_runtime, warnings, changes, excluded, source_files)
+            java_count = len(list((staged / 'java').rglob('*.java')))
+            objc_count = sum(1 for path in (staged / 'objc').rglob('*')
+                             if path.is_file() and path.name.endswith(('.pbobjc.h', '.pbobjc.m')))
+            result = ConversionResult(None, len(logical), java_count, version, request.target_runtime,
+                                      warnings, changes, excluded, source_files,
+                                      output_language=request.output_language, objc_count=objc_count,
+                                      generated_count=java_count + objc_count)
         progress('exporting', '正在整理输出文件' if request.action == 'inspect' else '正在发布输出文件',
                  processed=result.proto_count, total=result.proto_count)
         if request.action == 'inspect' and preparation_target is not None:

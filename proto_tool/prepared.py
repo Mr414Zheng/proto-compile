@@ -9,7 +9,7 @@ from pathlib import Path
 from . import ProtoError
 from .extract import safe_name
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_NAME = 'manifest.json'
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
@@ -44,7 +44,7 @@ def identity(request, protoc, version):
     return dict(input_kind=request.input_kind,
                 input_paths=[str(Path(p).expanduser().resolve()) for p in request.input_paths],
                 include_paths=[str(Path(p).expanduser().resolve()) for p in request.include_paths],
-                target_runtime=request.target_runtime, compiler_path=str(protoc), compiler_version=version,
+                target_runtime=request.target_runtime, output_language=request.output_language, compiler_path=str(protoc), compiler_version=version,
                 exclude_opt_0081=request.exclude_opt_0081, java_package=request.java_package,
                 no_repairs=request.no_repairs,
                 repairs=str(Path(request.repairs).expanduser().resolve()) if request.repairs else None)
@@ -62,11 +62,14 @@ def binding_state(names, roots):
             for name in sorted(names)}
 
 
-def artifact_hashes(root, cancellation=None):
+def artifact_hashes(root, cancellation=None, output_language='java'):
+    if output_language not in ('java', 'objc'):
+        raise InvalidPreparation('预检输出语言无效')
+    directories_allowed = (output_language, 'proto')
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise InvalidPreparation('预检目录不存在或为符号链接')
-    if not all((root / name).is_dir() and not (root / name).is_symlink() for name in ('java', 'proto')):
+    if not all((root / name).is_dir() and not (root / name).is_symlink() for name in directories_allowed):
         raise InvalidPreparation('预检目录结构无效')
     result = {}
     for current, directories, files in os.walk(root, followlinks=False):
@@ -75,7 +78,7 @@ def artifact_hashes(root, cancellation=None):
             cancellation.check()
         for name in directories:
             path = current / name
-            if path.is_symlink() or path.relative_to(root).parts[0] not in ('java', 'proto'):
+            if path.is_symlink() or path.relative_to(root).parts[0] not in directories_allowed:
                 raise InvalidPreparation('预检目录包含非法目录或符号链接')
         for name in files:
             path = current / name
@@ -84,7 +87,8 @@ def artifact_hashes(root, cancellation=None):
                 raise InvalidPreparation('预检目录包含符号链接')
             if relative.as_posix() == MANIFEST_NAME:
                 continue
-            if relative.parts[0] not in ('java', 'proto') or path.suffix != ('.java' if relative.parts[0] == 'java' else '.proto'):
+            expected = ('.proto',) if relative.parts[0] == 'proto' else (('.java',) if output_language == 'java' else ('.pbobjc.h', '.pbobjc.m'))
+            if relative.parts[0] not in directories_allowed or not path.name.endswith(expected):
                 raise InvalidPreparation('预检目录包含非转换产物')
             result[relative.as_posix()] = file_hash(path, cancellation)
     return result
@@ -118,30 +122,36 @@ def load(path, cancellation=None, expected_snapshot=None):
             raise InvalidPreparation('预检产物路径无效') from exc
         if not isinstance(digest, str) or len(digest) != 64:
             raise InvalidPreparation('预检产物摘要无效')
-    for key in ('proto_count', 'java_count'):
+    language = result.get('output_language')
+    if language not in ('java', 'objc') or data['snapshot'].get('identity', {}).get('output_language') != language:
+        raise InvalidPreparation('预检输出语言不一致')
+    for key in ('proto_count', 'java_count', 'objc_count', 'generated_count'):
         if type(result.get(key)) is not int or result[key] < 0:
             raise InvalidPreparation('预检计数无效')
     for key in ('warnings', 'changes', 'excluded', 'source_files'):
         if not isinstance(result.get(key), list) or not all(isinstance(value, str) for value in result[key]):
             raise InvalidPreparation('预检结果结构无效')
-    if result['proto_count'] != sum(name.startswith('proto/') for name in artifacts) or result['java_count'] != sum(name.startswith('java/') for name in artifacts):
+    if (result['proto_count'] != sum(name.startswith('proto/') for name in artifacts)
+            or result['java_count'] != sum(name.startswith('java/') for name in artifacts)
+            or result['objc_count'] != sum(name.startswith('objc/') for name in artifacts)
+            or result['generated_count'] != result['java_count'] + result['objc_count']):
         raise InvalidPreparation('预检产物计数不一致')
-    if artifact_hashes(root, cancellation) != artifacts:
+    if artifact_hashes(root, cancellation, output_language=language) != artifacts:
         raise InvalidPreparation('预检产物校验失败')
     return data
 
 
 def save(root, snapshot, result, cancellation=None):
-    artifacts = artifact_hashes(root, cancellation)
+    artifacts = artifact_hashes(root, cancellation, output_language=result.output_language)
     data = dict(format_version=FORMAT_VERSION, snapshot=snapshot, artifacts=artifacts,
                 result={key: getattr(result, key) for key in ('proto_count', 'java_count', 'compiler_version',
-                        'runtime_version', 'warnings', 'changes', 'excluded', 'source_files')})
+                        'runtime_version', 'output_language', 'objc_count', 'generated_count', 'warnings', 'changes', 'excluded', 'source_files')})
     data['integrity'] = _manifest_digest(data)
     (Path(root) / MANIFEST_NAME).write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
 
 
 def copy_verified(path, destination, manifest, cancellation=None):
-    for name in ('java', 'proto'):
+    for name in (manifest['result']['output_language'], 'proto'):
         (destination / name).mkdir(parents=True, exist_ok=True)
     for name in manifest['artifacts']:
         if cancellation:
@@ -154,5 +164,5 @@ def copy_verified(path, destination, manifest, cancellation=None):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    if artifact_hashes(destination, cancellation) != manifest['artifacts']:
+    if artifact_hashes(destination, cancellation, output_language=manifest['result']['output_language']) != manifest['artifacts']:
         raise InvalidPreparation('复制后的预检产物校验失败')

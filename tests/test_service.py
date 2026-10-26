@@ -55,10 +55,13 @@ if '--version' in sys.argv:
     raise SystemExit(0)
 ''' + ('time.sleep(30)\n' if sleep else '') + ('''print('main.proto:2:3: invalid field', file=sys.stderr)
 raise SystemExit(1)
-''' if fail else '''out = pathlib.Path(next(s.split('=', 1)[1] for s in sys.argv if s.startswith('--java_out=')))
+''' if fail else '''argument = next(s for s in sys.argv if s.startswith(('--java_out=', '--objc_out=')))
+out = pathlib.Path(argument.split('=', 1)[1])
+extensions = ('.java',) if argument.startswith('--java_out=') else ('.pbobjc.h', '.pbobjc.m')
 for item in sys.argv[1:]:
     if item.endswith('.proto'):
-        (out / (pathlib.Path(item).stem + '.java')).write_text('// generated fixture')
+        for extension in extensions:
+            (out / (pathlib.Path(item).stem + extension)).write_text('// generated fixture')
 '''))
         self.compiler.write_text(self.compiler.read_text().replace('COMPILER_VERSION', COMPILER_VERSIONS[runtime]))
         self.compiler.chmod(0o755)
@@ -228,6 +231,8 @@ raise SystemExit(main())
         self.assertTrue(all(m['protocol_version'] == 1 and m['task_id'] == '任务 1' for m in messages))
         self.assertEqual(messages[-1]['type'], 'result')
         self.assertEqual(messages[-1]['proto_count'], 1)
+        self.assertEqual((messages[-1]['output_language'], messages[-1]['java_count'],
+                          messages[-1]['objc_count'], messages[-1]['generated_count']), ('java', 1, 0, 1))
         self.assertNotIn('result', messages[-1])
 
     def test_version_result_has_empty_arrays_and_no_output(self):
@@ -606,6 +611,126 @@ raise SystemExit(main())
                 convert(request, cancel_at_stage, token)
             self.assertEqual(list(parent.iterdir()), [])
 
+    def test_language_protocol_default_validation_and_version(self):
+        payload = dict(protocol_version=1, task_id='language', action='version', input_kind='proto',
+                       input_paths=[], include_paths=[])
+        self.assertEqual(parse_request(payload).output_language, 'java')
+        for language in ('java', 'objc'):
+            payload['output_language'] = language
+            self.fake_compiler()
+            stdout = io.StringIO()
+            with patch('proto_tool.service.find_protoc', return_value=(self.compiler, 'libprotoc 25.9')):
+                self.assertEqual(main(io.StringIO(json.dumps(payload)), stdout), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result['output_language'], language)
+            self.assertEqual((result['java_count'], result['objc_count'], result['generated_count']), (0, 0, 0))
+        for language in ('swift', '', None, [], True):
+            payload['output_language'] = language
+            with self.subTest(language=language), self.assertRaises(ConversionError) as error:
+                parse_request(payload)
+            self.assertEqual(error.exception.code, 'INVALID_REQUEST')
+            with self.assertRaises(ConversionError):
+                convert(self.request(output_language=language))
+
+    def test_objc_preparation_reuse_switching_dependency_change_and_counts(self):
+        self.fake_compiler()
+        source = self.proto('main.proto', 'syntax="proto2"; import "dep.proto"; message Main {}')
+        dependency = self.proto('dep.proto', 'syntax="proto2"; message Dep {}')
+        request, inspected = self.inspected(self.request([source], output_language='objc'))
+        self.assertEqual((inspected.java_count, inspected.objc_count, inspected.generated_count), (0, 4, 4))
+        manifest = prepared.load(inspected.preparation_path)
+        self.assertEqual(manifest['snapshot']['identity']['output_language'], 'objc')
+        with patch('proto_tool.service._compile_collected', side_effect=AssertionError('must reuse')):
+            exported = convert(self.export_request(request, inspected))
+        self.assertEqual({p.name for p in Path(exported.output_path).iterdir()}, {'proto', 'objc'})
+        self.assertEqual((exported.java_count, exported.objc_count, exported.generated_count), (0, 4, 4))
+        with patch('proto_tool.service._compile_collected', wraps=service._compile_collected) as generator:
+            java = convert(self.export_request(request, inspected, output_language='java'))
+        self.assertEqual(generator.call_count, 1)
+        self.assertEqual((java.java_count, java.objc_count, java.generated_count), (2, 0, 2))
+        self.assertEqual({p.name for p in Path(java.output_path).iterdir()}, {'proto', 'java'})
+        dependency.write_text('syntax="proto2"; message Dep {optional string value=1;}')
+        with patch('proto_tool.service._compile_collected', wraps=service._compile_collected) as generator:
+            convert(self.export_request(request, inspected))
+        self.assertEqual(generator.call_count, 1)
+
+    def test_objc_preparation_damage_old_format_and_artifact_whitelist(self):
+        self.fake_compiler()
+        for damage in ('header', 'java', 'text', 'symlink', 'old-format', 'counts'):
+            with self.subTest(damage=damage):
+                request, inspected = self.inspected(self.request(output_language='objc'))
+                cache = Path(inspected.preparation_path)
+                if damage == 'header':
+                    next((cache / 'objc').glob('*.h')).write_text('damaged')
+                elif damage in ('java', 'text'):
+                    (cache / 'objc' / ('extra.java' if damage == 'java' else 'extra.txt')).write_text('foreign')
+                elif damage == 'symlink':
+                    header = next((cache / 'objc').glob('*.h'))
+                    header.unlink()
+                    header.symlink_to(self.inputs / 'main.proto')
+                else:
+                    manifest = json.loads((cache / prepared.MANIFEST_NAME).read_text())
+                    manifest.pop('integrity')
+                    if damage == 'old-format':
+                        manifest['format_version'] = 1
+                    else:
+                        manifest['result']['generated_count'] += 1
+                    manifest['integrity'] = prepared._manifest_digest(manifest)
+                    (cache / prepared.MANIFEST_NAME).write_text(json.dumps(manifest))
+                with patch('proto_tool.service._compile_collected', wraps=service._compile_collected) as generator:
+                    converted = convert(self.export_request(request, inspected))
+                self.assertEqual(generator.call_count, 1)
+                self.assertEqual(converted.generated_count, 2)
+                self.assertTrue(cache.exists())
+
+    def test_objc_preparation_copy_verification_and_cancel_leave_no_output(self):
+        self.fake_compiler()
+        request, inspected = self.inspected(self.request(output_language='objc'))
+        native_copy = prepared.shutil.copy2
+        damaged = False
+        def damage_copy(source, target):
+            nonlocal damaged
+            copied = native_copy(source, target)
+            if str(target).endswith('.pbobjc.h') and not damaged:
+                Path(target).write_text('copy was damaged')
+                damaged = True
+            return copied
+        with patch('proto_tool.prepared.shutil.copy2', side_effect=damage_copy), patch('proto_tool.service._compile_collected', wraps=service._compile_collected) as generator:
+            result = convert(self.export_request(request, inspected))
+        self.assertEqual(generator.call_count, 1)
+        self.assertEqual(result.generated_count, 2)
+        before = list(self.output.iterdir())
+        token = CancellationToken()
+        original = prepared.copy_verified
+        def cancel_copy(*args, **kwargs):
+            original(*args, **kwargs)
+            token.cancel()
+            token.check()
+        with patch('proto_tool.prepared.copy_verified', side_effect=cancel_copy), self.assertRaises(Cancelled):
+            convert(self.export_request(request, inspected), cancellation=token)
+        self.assertEqual(list(self.output.iterdir()), before)
+        self.assertTrue(Path(inspected.preparation_path).is_dir())
+
+    def test_objc_protocol_conversion_messages_and_cli(self):
+        self.fake_compiler()
+        source = self.proto('main.proto')
+        payload = dict(protocol_version=1, task_id='objc', action='convert', input_kind='proto',
+                       input_paths=[str(source)], include_paths=[], output_parent=str(self.output), output_language='objc')
+        stdout = io.StringIO()
+        with patch('proto_tool.service.find_protoc', return_value=(self.compiler, 'libprotoc 25.9')):
+            self.assertEqual(main(io.StringIO(json.dumps(payload)), stdout), 0)
+        messages = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        result = messages[-1]
+        self.assertEqual((result['output_language'], result['java_count'], result['objc_count'], result['generated_count']), ('objc', 0, 2, 2))
+        self.assertTrue(any('Objective-C' in message.get('message_zh', '') for message in messages))
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(cli_main(['compile', str(source), '--language', 'objc', '--protoc', str(self.compiler),
+                                       '-o', str(self.root / 'cli-objc')]), 0)
+        self.assertIn('2 个 Objective-C 文件', stdout.getvalue())
+        self.assertIn('Protobuf (CocoaPods) 3.25.9', stdout.getvalue())
+        self.assertNotIn('protobuf-java', stdout.getvalue())
+
 
 class BoundedGenerationTests(unittest.TestCase):
     def setUp(self):
@@ -725,6 +850,155 @@ class BoundedGenerationTests(unittest.TestCase):
             self.assertEqual(self.generated_hashes(direct), self.generated_hashes(batched))
             self.assertEqual(original.stderr, generated.stderr)
             self.assertEqual(original.stdout, generated.stdout)
+
+
+class ObjectiveCGenerationTests(unittest.TestCase):
+    setUp = BoundedGenerationTests.setUp
+    compiler = BoundedGenerationTests.compiler
+    proto = BoundedGenerationTests.proto
+    generated_hashes = BoundedGenerationTests.generated_hashes
+
+    def test_batched_objc_generation_matches_native_bytes_and_warnings(self):
+        self.proto('a.proto', 'syntax="proto2"; package a; option objc_class_prefix="PA"; message Shared {}')
+        self.proto('b.proto', 'syntax="proto2"; package b; option objc_class_prefix="PB"; import "a.proto"; message Shared {optional a.Shared peer=1;}')
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            logical, roots = collect_proto_files(list(self.inputs.glob('*.proto')), [self.inputs], compiler)
+            direct, batched = self.root / ('direct-' + runtime), self.root / ('batched-' + runtime)
+            direct.mkdir()
+            original = service.run([compiler, *[f'-I{root}' for root in roots], f'--objc_out={direct}',
+                                    *[str(logical[name]) for name in sorted(logical)]], cwd=roots[0])
+            with patch('proto_tool.service.JAVA_BATCH_FILES', 1), patch('proto_tool.service.JAVA_BATCH_SOURCE_BYTES', 1):
+                generated = service._compile_collected(compiler, logical, roots, batched, output_language='objc')
+            self.assertEqual(self.generated_hashes(direct), self.generated_hashes(batched))
+            self.assertEqual(original.stderr, generated.stderr)
+            self.assertEqual(len(list(batched.iterdir())), 4)
+
+    def test_objc_recursive_dependencies_standard_include_and_source_options(self):
+        source = self.proto('main.proto', 'syntax="proto3"; package main; option objc_class_prefix="OWN"; import "dep.proto"; import "google/protobuf/empty.proto"; message Main {dep.Dep dep=1; google.protobuf.Empty empty=2;}')
+        self.proto('dep.proto', 'syntax="proto3"; package dep; option objc_class_prefix="DEP"; message Dep {}')
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            request = ConversionRequest('proto', [source], protoc=compiler, target_runtime=runtime,
+                                        output_language='objc', destination=self.root / runtime)
+            inspection = convert(replace(request, action='inspect', preparation_output=self.root / ('prepared-' + runtime)))
+            self.assertEqual((inspection.java_count, inspection.objc_count, inspection.generated_count), (0, 4, 4))
+            with patch('proto_tool.service._compile_collected', side_effect=AssertionError('native outputs must reuse')):
+                result = convert(replace(request, preparation_path=inspection.preparation_path))
+            output = Path(result.output_path)
+            self.assertEqual((result.proto_count, result.java_count, result.objc_count, result.generated_count), (2, 0, 4, 4))
+            self.assertEqual({p.name for p in output.iterdir()}, {'proto', 'objc'})
+            self.assertFalse((output / 'proto/google').exists())
+            self.assertEqual((output / 'proto/main.proto').read_bytes(), source.read_bytes())
+            self.assertIn('@interface OWNMain', (output / 'objc/Main.pbobjc.h').read_text())
+
+    def test_html_same_type_names_have_distinct_classes_and_preserved_custom_prefix(self):
+        bodies = ['// $(FILE)a.proto\nsyntax="proto2"; package a; enum State {OK=0;} message Shared {}',
+                  '// $(FILE)b.proto\nsyntax="proto2"; package b; import "a.proto"; enum State {OK=0;} message Shared {optional a.Shared peer=1;}',
+                  '// $(FILE)custom.proto\nsyntax="proto2"; option objc_class_prefix="USR"; message Shared {}']
+        source = self.root / 'same-names.html'
+        source.write_text(''.join('<div title="fixture"><pre>' + html.escape(body) + '</pre></div>' for body in bodies))
+        original = source.read_bytes()
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            result = convert(ConversionRequest('html', [source], protoc=compiler, target_runtime=runtime,
+                                               output_language='objc', destination=self.root / runtime))
+            output = Path(result.output_path)
+            self.assertEqual((result.proto_count, result.objc_count, result.generated_count), (3, 6, 6))
+            for file, prefix in (('A', 'PCTa_'), ('B', 'PCTb_'), ('Custom', 'USR')):
+                header = (output / 'objc' / (file + '.pbobjc.h')).read_text()
+                self.assertIn('@interface ' + prefix + 'Shared', header)
+            for proto in (output / 'proto').glob('*.proto'):
+                self.assertNotIn('java_package', proto.read_text())
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_html_explicit_prefix_conflict_and_invalid_options_keep_diagnostics(self):
+        source = self.root / 'explicit-prefixes.html'
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            for options, diagnostic in (('option objc_class_prefix="USR";', 'Objective-C 符号冲突: USRShared'),
+                                        ('option objc_class_prefix="USR"; option objc_class_prefix="USR";', 'already set')):
+                bodies = [f'// $(FILE){name}.proto\nsyntax="proto2"; {options} message Shared {{}}' for name in ('a', 'b')]
+                source.write_text(''.join('<div title="prefix"><pre>' + html.escape(body) + '</pre></div>' for body in bodies))
+                output = self.root / ('out-' + runtime)
+                with self.assertRaises(ConversionError) as error:
+                    convert(ConversionRequest('html', [source], protoc=compiler, target_runtime=runtime,
+                                              output_language='objc', destination=output))
+                self.assertIn(diagnostic, error.exception.details)
+                self.assertFalse(output.exists())
+
+    def test_objc_cross_header_symbol_conflict_is_actionable_and_never_published(self):
+        for kind in ('message', 'enum'):
+            self.proto('a.proto', 'syntax="proto2"; package a; option objc_class_prefix="USR"; ' + ('message Shared {}' if kind == 'message' else 'enum Shared {OK=0;}'))
+            self.proto('b.proto', 'syntax="proto2"; package b; option objc_class_prefix="USR"; ' + ('message Shared {}' if kind == 'message' else 'enum Shared {OK=0;}'))
+            for runtime in ('3.25.9', '3.6.1'):
+                compiler = self.compiler(runtime)
+                for batched in (False, True):
+                    output = self.root / (runtime + kind + str(batched))
+                    with patch('proto_tool.service.JAVA_BATCH_FILES', 1 if batched else 10), patch('proto_tool.service.JAVA_BATCH_SOURCE_BYTES', 1 if batched else 32768):
+                        with self.assertRaises(ConversionError) as error:
+                            convert(ConversionRequest('proto', [self.inputs], protoc=compiler, target_runtime=runtime,
+                                                      output_language='objc', destination=output))
+                    self.assertEqual(error.exception.code, 'COMPILATION_FAILED')
+                    self.assertIn('Objective-C 符号冲突: USRShared', error.exception.details)
+                    self.assertIn('objc_class_prefix', error.exception.details)
+                    self.assertFalse(output.exists())
+
+    def test_objc_batched_file_collision_matches_native_failure(self):
+        files = [self.proto('foo_bar.proto', 'syntax="proto2"; package a; message A {}'),
+                 self.proto('fooBar.proto', 'syntax="proto2"; package b; message B {}')]
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            direct = self.root / ('direct-' + runtime)
+            direct.mkdir()
+            with self.assertRaises(ProtoError) as original:
+                service.run([compiler, f'-I{self.inputs}', f'--objc_out={direct}', *map(str, files)])
+            batched = self.root / ('batched-' + runtime)
+            with patch('proto_tool.service.JAVA_BATCH_FILES', 1), patch('proto_tool.service.JAVA_BATCH_SOURCE_BYTES', 1):
+                with self.assertRaises(ProtoError) as generated:
+                    service.compile_files(compiler, files, [self.inputs], batched, output_language='objc')
+            for name in ('FooBar.pbobjc.h', 'FooBar.pbobjc.m'):
+                self.assertIn(name + ': Tried to write the same file twice.', str(original.exception))
+                self.assertIn(name + ': Tried to write the same file twice.', str(generated.exception))
+            self.assertEqual(list(batched.iterdir()), [])
+
+    def test_objc_batched_global_conflict_and_cancellation_do_not_publish(self):
+        files = [self.proto('a.proto', 'syntax="proto2"; package same; message Shared {}'),
+                 self.proto('b.proto', 'syntax="proto2"; package same; message Shared {}')]
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            with patch('proto_tool.service.JAVA_BATCH_FILES', 1), patch('proto_tool.service.JAVA_BATCH_SOURCE_BYTES', 1):
+                with self.assertRaises(ProtoError) as error:
+                    service.compile_files(compiler, files, [self.inputs], self.root / runtime, output_language='objc')
+            self.assertIn('already defined', str(error.exception))
+        self.proto('b.proto', 'syntax="proto2"; package distinct; message B {}')
+        token = CancellationToken()
+        native = service.run
+        calls = []
+        def cancel_second(command, **kwargs):
+            if any(str(arg).startswith('--objc_out=') for arg in command):
+                calls.append(command)
+                if len(calls) == 2:
+                    token.cancel()
+            return native(command, **kwargs)
+        output = self.root / 'cancelled'
+        with patch('proto_tool.service.JAVA_BATCH_FILES', 1), patch('proto_tool.service.JAVA_BATCH_SOURCE_BYTES', 1), patch('proto_tool.service.run', side_effect=cancel_second):
+            with self.assertRaises(Cancelled):
+                convert(ConversionRequest('proto', [self.inputs], output_language='objc', destination=output), cancellation=token)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(output.exists())
+        self.assertFalse(list(self.root.glob('.proto-build-*')))
+
+    @unittest.skipUnless((ROOT / 'device protocol v16.2.html').is_file(), '未提供本地私有协议文档')
+    def test_representative_private_html_generates_objc_for_both_runtimes(self):
+        source = ROOT / 'device protocol v16.2.html'
+        original = hashlib.sha256(source.read_bytes()).hexdigest()
+        for runtime in ('3.25.9', '3.6.1'):
+            compiler = self.compiler(runtime)
+            result = convert(ConversionRequest('html', [source], protoc=compiler, target_runtime=runtime,
+                                               output_language='objc', destination=self.root / runtime))
+            self.assertEqual((result.proto_count, result.java_count, result.objc_count, result.generated_count), (57, 0, 114, 114))
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original)
 
 
 if __name__ == '__main__':

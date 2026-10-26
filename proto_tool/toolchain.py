@@ -20,7 +20,7 @@ INSTALL = ROOT / '.tools' / 'native-protoc' / RUNTIME_VERSION / platform.machine
 
 def validate_target_runtime(target_runtime):
     if target_runtime not in TARGET_RUNTIMES:
-        raise ProtoError(f'不支持的 Java 运行库版本: {target_runtime!r}；请选择 3.25.9 或 3.6.1')
+        raise ProtoError(f'不支持的运行库版本: {target_runtime!r}；请选择 3.25.9 或 3.6.1')
     return target_runtime
 
 
@@ -81,7 +81,7 @@ def find_protoc(explicit=None, cancellation=None, target_runtime=RUNTIME_VERSION
         # 冻结应用必须自包含，不能误用用户 PATH 中版本不兼容的编译器。
         candidate = Path(sys._MEIPASS) / 'toolchains' / target_runtime / 'bin' / 'protoc'
         if not candidate.is_file():
-            raise ProtoError(f'应用内置 protoc 缺失（Java 运行库 {target_runtime}），请重新安装应用')
+            raise ProtoError(f'应用内置 protoc 缺失（运行库 {target_runtime}），请重新安装应用')
     elif explicit:
         candidate = Path(explicit).expanduser()
         if not candidate.is_file():
@@ -100,5 +100,5 @@ def find_protoc(explicit=None, cancellation=None, target_runtime=RUNTIME_VERSION
     version = run([candidate, '--version'], cancellation=cancellation).stdout.strip()
     expected = 'libprotoc ' + COMPILER_VERSIONS[target_runtime]
     if version != expected:
-        raise ProtoError(f'编译器与 Java 运行库版本不匹配：目标 protobuf-java {target_runtime} 需要 {expected}，实际为 {version or "未知版本"}。请准备对应工具链或调整 --target-runtime')
+        raise ProtoError(f'编译器与运行库版本不匹配：目标 Protobuf {target_runtime} 需要 {expected}，实际为 {version or "未知版本"}。请准备对应工具链或调整 --target-runtime')
     return candidate, version

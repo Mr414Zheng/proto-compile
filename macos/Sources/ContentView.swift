@@ -86,7 +86,7 @@ struct ContentView: View {
                 .font(.system(size: 36)).foregroundColor(.accentColor).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text("Proto Compile").font(.title2.weight(.semibold))
-                Text("从协议文档或 Proto 文件生成 Java 源码")
+                Text("从协议文档或 Proto 文件生成 \(model.outputLanguage.label) 源码")
                     .foregroundColor(.secondary)
             }
             Spacer()
@@ -149,21 +149,31 @@ struct ContentView: View {
     private var targetSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
+                Picker("导出语言", selection: Binding(get: { model.outputLanguage }, set: { model.setOutputLanguage($0) })) {
+                    ForEach(AppModel.OutputLanguage.allCases, id: \.self) { language in
+                        Text(language.label).tag(language)
+                    }
+                }.pickerStyle(.segmented)
                 Picker("生成目标", selection: Binding(get: { model.targetRuntime }, set: { model.setTargetRuntime($0) })) {
                     ForEach(AppModel.TargetRuntime.allCases, id: \.self) { target in
-                        Text(target.label).tag(target)
+                        Text(target.label(for: model.outputLanguage)).tag(target)
                     }
                 }.pickerStyle(.menu)
                 if model.targetRuntime == .compatible {
-                    Text("适用于暂时无法升级 protobuf-java 的旧项目。")
+                    Text("适用于暂时无法升级 \(model.outputLanguage.runtimeName) 的旧项目。")
                         .font(.callout).foregroundColor(.secondary)
                 }
                 HStack(spacing: 12) {
                     Text("项目依赖").font(.callout)
-                    Text(model.targetRuntime.dependency)
+                    Text(model.targetRuntime.dependency(for: model.outputLanguage))
                         .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Button("复制", action: model.copyDependency).help("复制 Maven / Gradle 依赖坐标")
+                    Button("复制", action: model.copyDependency)
+                        .help(model.outputLanguage == .java ? "复制 Maven / Gradle 依赖坐标" : "复制 CocoaPods 依赖声明")
+                }
+                if model.outputLanguage == .objc {
+                    Text("导出 .h / .m 文件；请在项目中集成对应版本的 Protobuf Objective-C 运行库。")
+                        .font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
         } label: { Label("2. 选择生成目标", systemImage: "shippingbox").font(.headline) }
@@ -251,7 +261,8 @@ struct ContentView: View {
     }
 
     private func successSection(_ result: EngineMessage) -> some View {
-        GroupBox {
+        let language = AppModel.OutputLanguage(rawValue: result.resolvedOutputLanguage) ?? model.outputLanguage
+        return GroupBox {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Label("结果已导出", systemImage: "checkmark.circle.fill").font(.headline)
@@ -259,10 +270,10 @@ struct ContentView: View {
                     Button("在 Finder 中打开", action: model.revealResult)
                 }
                 if let path = result.output_path { pathText(path) }
-                Text("\(result.proto_count ?? 0) 个 Proto  ·  \(result.java_count ?? 0) 个 Java")
+                Text("\(result.proto_count ?? 0) 个 Proto  ·  \(result.generatedFileCount) 个 \(language.label) 文件")
                     .font(.callout).foregroundColor(.secondary)
                 if let runtime = result.runtime_version {
-                    Text("目标运行库：protobuf-java \(runtime)").font(.callout).foregroundColor(.secondary)
+                    Text("目标运行库：\(language.runtimeName) \(runtime)").font(.callout).foregroundColor(.secondary)
                 }
                 if let warnings = result.warnings, !warnings.isEmpty {
                     Label("\(warnings.count) 条警告", systemImage: "exclamationmark.triangle")
@@ -312,9 +323,9 @@ struct ContentView: View {
             Image(systemName: "curlybraces.square.fill").font(.system(size: 56)).foregroundColor(.accentColor).accessibilityHidden(true)
             Text("Proto Compile").font(.title2.weight(.semibold))
             Text("版本 \(model.version) (\(model.build))")
-            Text("当前目标：protobuf-java \(model.targetRuntime.rawValue)")
+            Text("当前目标：\(model.outputLanguage.runtimeName) \(model.targetRuntime.rawValue)")
             Text("内置 protoc：\(model.compilerVersion)").textSelection(.enabled)
-            Text("将 HTML 协议文档与 Proto 文件转换为 Java 源码。\n所有转换均在本机完成。")
+            Text("将 HTML 协议文档与 Proto 文件转换为 Java 或 Objective-C 源码。\n所有转换均在本机完成。")
                 .multilineTextAlignment(.center).foregroundColor(.secondary)
             Button("完成") { model.showAbout = false }.keyboardShortcut(.defaultAction)
         }.padding(32).frame(width: 400)

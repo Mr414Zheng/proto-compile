@@ -89,24 +89,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         do {
             let data = try JSONEncoder().encode(request)
             let dictionary = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            guard dictionary?["protocol_version"] as? Int == 1, dictionary?["target_runtime"] as? String == "3.25.9", model.targetRuntime == .current, model.excludeOPT0081, !model.canConvert else {
+            guard dictionary?["protocol_version"] as? Int == 1, dictionary?["target_runtime"] as? String == "3.25.9", dictionary?["output_language"] as? String == "java", model.outputLanguage == .java, model.targetRuntime == .current, model.excludeOPT0081, !model.canConvert else {
                 throw EngineFailure(title: "模型初始状态不正确", suggestion: "", details: "")
             }
             let response = Data("{\"protocol_version\":1,\"task_id\":\"smoke\",\"type\":\"result\",\"proto_count\":0,\"java_count\":0,\"compiler_version\":\"test\",\"warnings\":[],\"changes\":[],\"excluded\":[],\"source_files\":[]}".utf8)
             let decoded = try JSONDecoder().decode(EngineMessage.self, from: response)
-            guard decoded.compiler_version == "test" else { throw EngineFailure(title: "协议解析失败", suggestion: "", details: "") }
+            guard decoded.compiler_version == "test", decoded.resolvedOutputLanguage == "java", decoded.generatedFileCount == 0 else { throw EngineFailure(title: "协议解析失败", suggestion: "", details: "") }
             print("SwiftUI model and protocol smoke test passed")
             exit(0)
         } catch { fputs("Smoke test failed: \(error)\n", stderr); exit(1) }
     }
 
     /// 无面板端到端入口沿用真实模型与 bundle 内引擎，不注入预览结果。
-    func integrationTest(html: String, outputParent: String, runtime: String) {
+    func integrationTest(html: String, outputParent: String, runtime: String, language: String = "java") {
         guard let selected = AppModel.TargetRuntime(rawValue: runtime) else {
             fputs("Unsupported target runtime: \(runtime). Use 3.25.9 or 3.6.1.\n", stderr)
             exit(2)
         }
+        guard let selectedLanguage = AppModel.OutputLanguage(rawValue: language) else {
+            fputs("Unsupported output language: \(language). Use java or objc.\n", stderr)
+            exit(2)
+        }
         model.targetRuntime = selected
+        model.setOutputLanguage(selectedLanguage)
         let started = Date()
         var converting = false
         var finishing = false
@@ -133,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     return
                 }
                 if !converting, !model.isInspecting {
-                    guard model.inspection != nil, model.canConvert else {
+                    guard model.inspection?.output_language == selectedLanguage.rawValue, model.canConvert else {
                         fail("inspect 未产生有效结果，或 canConvert 未变为 true。")
                         return
                     }
@@ -146,12 +151,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 if converting, !model.isConverting, let result = model.result {
                     guard let protoCount = result.proto_count, let javaCount = result.java_count,
-                          protoCount > 0, javaCount > 0,
+                          let objcCount = result.objc_count, let generatedCount = result.generated_count,
+                          protoCount > 0, generatedCount > 0,
+                          result.output_language == selectedLanguage.rawValue,
+                          selectedLanguage == .java ? (javaCount == generatedCount && objcCount == 0) : (objcCount == generatedCount && javaCount == 0),
                           let output = result.output_path,
                           FileManager.default.fileExists(atPath: output),
                           let compilerVersion = result.compiler_version, !compilerVersion.isEmpty,
                           result.runtime_version == selected.rawValue else {
                         fail("转换结果缺少有效计数、输出目录、编译器版本，或运行库目标不符。")
+                        return
+                    }
+                    let generatedRoot = URL(fileURLWithPath: output).appendingPathComponent(selectedLanguage.rawValue)
+                    let files = (FileManager.default.enumerator(at: generatedRoot, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
+                    let extensions = selectedLanguage == .java ? ["java"] : ["h", "m"]
+                    guard files.filter({ extensions.contains($0.pathExtension) }).count == generatedCount,
+                          selectedLanguage != .objc || files.filter({ $0.pathExtension == "h" }).count == files.filter({ $0.pathExtension == "m" }).count else {
+                        fail("产物文件数量或 Objective-C 头文件 / 实现文件配对数量不符。")
                         return
                     }
                     let summary: [String: Any] = [
@@ -160,6 +176,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         "inspect_proto_count": model.inspection?.proto_count ?? 0,
                         "proto_count": protoCount,
                         "java_count": javaCount,
+                        "objc_count": objcCount,
+                        "generated_count": generatedCount,
+                        "output_language": result.output_language ?? "",
                         "compiler_version": compilerVersion,
                         "runtime_version": result.runtime_version ?? "",
                         "application_version": model.version,
@@ -205,11 +224,15 @@ struct ProtoCompileApplication {
         let delegate = AppDelegate()
         if CommandLine.arguments.contains("--smoke-test") { delegate.smokeTest(); return }
         if let index = CommandLine.arguments.firstIndex(of: "--integration-test") {
-            guard CommandLine.arguments.count == index + 3 || CommandLine.arguments.count == index + 4 else {
-                fputs("Usage: --integration-test <html> <outputParent> [3.25.9|3.6.1]\n", stderr)
+            guard (index + 3...index + 5).contains(CommandLine.arguments.count) else {
+                fputs("Usage: --integration-test <html> <outputParent> [3.25.9|3.6.1] [java|objc]\n", stderr)
                 exit(2)
             }
-            delegate.integrationTest(html: CommandLine.arguments[index + 1], outputParent: CommandLine.arguments[index + 2], runtime: CommandLine.arguments.count == index + 4 ? CommandLine.arguments[index + 3] : AppModel.TargetRuntime.current.rawValue)
+            let options = Array(CommandLine.arguments.dropFirst(index + 3))
+            let languageOnly = options.count == 1 && AppModel.OutputLanguage(rawValue: options[0]) != nil
+            let runtime = !options.isEmpty && !languageOnly ? options[0] : AppModel.TargetRuntime.current.rawValue
+            let language = languageOnly ? options[0] : (options.count == 2 ? options[1] : "java")
+            delegate.integrationTest(html: CommandLine.arguments[index + 1], outputParent: CommandLine.arguments[index + 2], runtime: runtime, language: language)
             withExtendedLifetime(delegate) { RunLoop.main.run() }
             return
         }

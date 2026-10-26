@@ -42,8 +42,10 @@ class Reference:
 
 
 class Schema:
-    def __init__(self, source):
+    def __init__(self, source, output_language='java'):
         self.source = source
+        self.output_language = output_language
+        self.has_objc_prefix = False
         self.tokens = [Token(m[0], m.start(), m.end()) for m in TOKEN.finditer(source.text)
                        if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
         self.index = 0
@@ -158,7 +160,9 @@ class Schema:
                 self.parse_scope(scope, closing=True, oneof=True)
             elif kind in ('option', 'reserved'):
                 statement = self.statement()
-                if kind == 'option' and not scope and len(statement) > 1 and statement[1].value.startswith('java_'):
+                if kind == 'option' and not scope and len(statement) > 1 and statement[1].value == 'objc_class_prefix':
+                    self.has_objc_prefix = True
+                if self.output_language == 'java' and kind == 'option' and not scope and len(statement) > 1 and statement[1].value.startswith('java_'):
                     self.fail('HTML 规范化暂不接受已有 java_* 选项，请使用普通 proto 编译')
             elif scope:
                 if kind in ('extensions', 'extend', 'group'):
@@ -201,10 +205,12 @@ def validate_java_package(value):
     return value
 
 
-def normalize(sources, java_package='device.protocol'):
-    if java_package:
+def normalize(sources, java_package='device.protocol', output_language='java'):
+    if output_language not in ('java', 'objc'):
+        raise ProtoError('输出语言必须为 Java 或 Objective-C')
+    if java_package and output_language == 'java':
         validate_java_package(java_package)
-    schemas = {name: Schema(source) for name, source in sources.items() if name.endswith('.proto')}
+    schemas = {name: Schema(source, output_language=output_language) for name, source in sources.items() if name.endswith('.proto')}
     keys = {name: namespace_key(name) for name in schemas}
     if len(set(keys.values())) != len(keys):
         raise ProtoError('规范化后的文件命名空间冲突，请调整文件名')
@@ -294,7 +300,15 @@ def normalize(sources, java_package='device.protocol'):
         package = 'device_protocol.' + keys[name]
         # 显式空 Java 包覆盖 proto package，保留协议命名空间来隔离同名类型。
         java = java_package + '.' + keys[name] if java_package else ''
-        declaration = f'\npackage {package};\noption java_package = "{java}";\n'
+        declaration = f'\npackage {package};\n'
+        if output_language == 'java':
+            declaration += f'option java_package = "{java}";\n'
+        elif not schema.has_objc_prefix:
+            # ObjC 类名不会带上 proto 包名，以文件唯一命名空间避免同名类型互相覆盖。
+            prefix = 'PCT' + keys[name] + '_'
+            declaration += f'option objc_class_prefix = "{prefix}";\n'
+            changes.append({'file': name, 'kind': 'objc_prefix', 'from': '', 'to': prefix,
+                            'reason': f'设置 Objective-C 类名前缀 {prefix}'})
         if schema.package_span:
             schema.edits.append((*schema.package_span, ''))
         schema.edits.append((schema.syntax_end, schema.syntax_end, declaration))

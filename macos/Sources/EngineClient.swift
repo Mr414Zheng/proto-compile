@@ -11,6 +11,7 @@ struct EngineRequest: Encodable {
     let output_parent: String?
     let exclude_opt_0081: Bool
     let target_runtime: String
+    var output_language: String = "java"
     var preparation_output: String? = nil
     var preparation_path: String? = nil
 }
@@ -26,6 +27,9 @@ struct EngineMessage: Decodable {
     var output_path: String?
     var proto_count: Int?
     var java_count: Int?
+    var output_language: String?
+    var objc_count: Int?
+    var generated_count: Int?
     var compiler_version: String?
     var runtime_version: String?
     var preparation_path: String?
@@ -38,6 +42,9 @@ struct EngineMessage: Decodable {
     var file: String?
     var line: Int?
     var details: String?
+
+    var resolvedOutputLanguage: String { output_language ?? "java" }
+    var generatedFileCount: Int { generated_count ?? (resolvedOutputLanguage == "objc" ? objc_count : java_count) ?? 0 }
 }
 
 struct EngineFailure: Error {
@@ -107,7 +114,7 @@ final class EngineRun: @unchecked Sendable {
                             protocolError = "内置编译器版本不匹配：期望 \(expectedCompilerVersion)，实际输出 \(actual)。"
                             return
                         }
-                        terminal = EngineMessage(protocol_version: 1, task_id: request.task_id, type: "result", proto_count: 0, java_count: 0, compiler_version: actual, runtime_version: request.target_runtime)
+                        terminal = EngineMessage(protocol_version: 1, task_id: request.task_id, type: "result", proto_count: 0, java_count: 0, output_language: request.output_language, objc_count: 0, generated_count: 0, compiler_version: actual, runtime_version: request.target_runtime)
                         return
                     }
                     do {

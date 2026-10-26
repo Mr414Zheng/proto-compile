@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import ProtoError
-from .service import CancellationToken, ConversionError, ConversionRequest, convert
+from .service import CancellationToken, ConversionError, ConversionRequest, OUTPUT_LANGUAGES, convert
 from .toolchain import RUNTIME_VERSION, TARGET_RUNTIMES
 
 PROTOCOL_VERSION = 1
@@ -30,7 +30,10 @@ def parse_request(data):
             raise ConversionError(f'{key} 必须是绝对路径数组。', 'INVALID_REQUEST')
     target_runtime = data.get('target_runtime', RUNTIME_VERSION)
     if target_runtime not in TARGET_RUNTIMES:
-        raise ConversionError('不支持的 Java 运行库版本，请选择 3.25.9 或 3.6.1。', 'INVALID_REQUEST')
+        raise ConversionError('不支持的运行库版本，请选择 3.25.9 或 3.6.1。', 'INVALID_REQUEST')
+    output_language = data.get('output_language', 'java')
+    if output_language not in OUTPUT_LANGUAGES:
+        raise ConversionError('输出语言必须为 Java 或 Objective-C。', 'INVALID_REQUEST')
     parent = data.get('output_parent')
     if parent is not None and (not isinstance(parent, str) or not Path(parent).is_absolute()):
         raise ConversionError('输出父目录必须是绝对路径。', 'INVALID_REQUEST')
@@ -45,7 +48,7 @@ def parse_request(data):
     return ConversionRequest(input_kind=data['input_kind'], input_paths=data['input_paths'],
                              include_paths=data['include_paths'], output_parent=parent,
                              action=data['action'], exclude_opt_0081=data.get('exclude_opt_0081', True),
-                             target_runtime=target_runtime, preparation_output=data.get('preparation_output'),
+                             target_runtime=target_runtime, output_language=output_language, preparation_output=data.get('preparation_output'),
                              preparation_path=data.get('preparation_path'))
 
 

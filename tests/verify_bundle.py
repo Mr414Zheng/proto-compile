@@ -18,8 +18,8 @@ MACHO_MAGICS = {bytes.fromhex(value) for value in (
     'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca',
 )}
 RUNTIMES = {'3.25.9': 'libprotoc 25.9', '3.6.1': 'libprotoc 3.6.1'}
-APP_VERSION = '1.2.1'
-APP_BUILD = '4'
+APP_VERSION = '1.3.0'
+APP_BUILD = '5'
 
 
 def require(condition, message):
@@ -73,10 +73,38 @@ def verify_binary_dependencies(app, arch):
     print('PASS 全部 Mach-O 的最低系统声明均不高于 macOS 13.0（不替代真机运行验收）')
 
 
-def engine_request(engine, environment, parent, paths, kind, task_id, target_runtime):
+def verify_output(result, parent, language):
+    """核对实际文件、语言与计数，防止错误复用另一语言的预检产物。"""
+    require(result.get('output_language') == language, '结果导出语言不符')
+    output = Path(result['output_path']).resolve()
+    require(output.parent == parent.resolve() and output.is_dir(), '结果不在选择的导出父目录中')
+    require({path.name for path in output.iterdir()} == {language, 'proto'},
+            f'结果必须仅含 {language}/proto')
+    require(result['proto_count'] == len(list((output / 'proto').rglob('*.proto'))) > 0,
+            'Proto 数量不符或为空')
+    generated = [path for path in (output / language).rglob('*') if path.is_file()]
+    if language == 'java':
+        require(all(path.suffix == '.java' for path in generated), 'Java 目录包含非 Java 产物')
+        require(result.get('java_count') == len(generated) > 0 and result.get('objc_count') == 0,
+                'Java 数量不符或混入 Objective-C 计数')
+    else:
+        headers = {path.relative_to(output / language).as_posix()[:-2]
+                   for path in generated if path.name.endswith('.pbobjc.h')}
+        sources = {path.relative_to(output / language).as_posix()[:-2]
+                   for path in generated if path.name.endswith('.pbobjc.m')}
+        require(bool(headers) and headers == sources and len(generated) == len(headers) * 2,
+                'Objective-C 头文件与实现文件未成对或混入其他产物')
+        require(result.get('objc_count') == len(generated) and result.get('java_count') == 0,
+                'Objective-C 数量不符或混入 Java 计数')
+    require(result.get('generated_count') == len(generated), '总生成文件数量不符')
+    return output
+
+
+def engine_request(engine, environment, parent, paths, kind, task_id, target_runtime, language):
     request = dict(protocol_version=1, task_id=task_id, action='convert', input_kind=kind,
                    input_paths=[str(path) for path in paths], include_paths=[],
-                   output_parent=str(parent), exclude_opt_0081=True, target_runtime=target_runtime)
+                   output_parent=str(parent), exclude_opt_0081=True, target_runtime=target_runtime,
+                   output_language=language)
     process = command([engine], input=json.dumps(request), env=environment, cwd=parent.parent)
     require(not process.stderr, f'引擎标准错误输出：{process.stderr}')
     messages = [json.loads(line) for line in process.stdout.splitlines()]
@@ -86,14 +114,8 @@ def engine_request(engine, environment, parent, paths, kind, task_id, target_run
     result = messages[-1]
     require(result.get('type') == 'result', f'引擎没有成功结果：{result}')
     require(result.get('compiler_version') == RUNTIMES[target_runtime], f'编译器版本不符：{result}')
-    require(result.get('runtime_version') == target_runtime, f'Java 运行库版本不符：{result}')
-    output = Path(result['output_path']).resolve()
-    require(output.parent == parent.resolve(), '结果不在选择的导出父目录中')
-    require({path.name for path in output.iterdir()} == {'java', 'proto'}, '结果必须仅含 java/proto')
-    require(result['proto_count'] == len(list((output / 'proto').rglob('*.proto'))) > 0,
-            'Proto 数量不符或为空')
-    require(result['java_count'] == len(list((output / 'java').rglob('*.java'))) > 0,
-            'Java 数量不符或为空')
+    require(result.get('runtime_version') == target_runtime, f'运行库版本不符：{result}')
+    verify_output(result, parent, language)
     return result
 
 
@@ -133,40 +155,36 @@ def verify(app, arch, html=None):
                 env=environment, cwd=folder)
         print('PASS 移动后的 Swift 应用模型/协议 smoke test（不代表原生面板人工验收）')
         output_paths = set()
-        for runtime in RUNTIMES:
-            result = engine_request(engine, environment, parent, [source], 'proto',
-                                    f'bundle-proto-{runtime}', runtime)
-            require(result['proto_count'] == 1 and result['java_count'] == 1,
-                    '标准 protobuf 依赖不能导出为用户文件')
-            require(result['output_path'] not in output_paths, '不同转换复用了同一结果目录')
-            output_paths.add(result['output_path'])
-            print(f'PASS Java {runtime} / {RUNTIMES[runtime]}：隔离 PATH/Python 环境后完成真实 Proto 转换')
-            if html is None:
-                continue
-            result = engine_request(engine, environment, parent, [copied_html], 'html',
-                                    f'bundle-html-{runtime}', runtime)
-            require(result['output_path'] not in output_paths, '不同转换复用了同一结果目录')
-            output_paths.add(result['output_path'])
-            print(f'PASS Java {runtime} HTML：{result["proto_count"]} Proto / {result["java_count"]} Java')
-            integration = command([relocated / 'Contents/MacOS/ProtoCompile', '--integration-test',
-                                   copied_html, parent, runtime], env=environment, cwd=folder)
-            summary = json.loads(integration.stdout)
-            require(summary.get('status') == 'passed', 'Swift 应用端到端转换失败')
-            require(summary.get('proto_count') == result['proto_count']
-                    and summary.get('java_count') == result['java_count'], 'Swift 与引擎转换数量不一致')
-            require(summary.get('compiler_version') == RUNTIMES[runtime]
-                    and summary.get('runtime_version') == runtime, 'Swift 的编译器/运行库目标不符')
-            require(summary.get('application_version') == APP_VERSION
-                    and summary.get('application_build') == APP_BUILD, 'Swift 读取的应用版本不符')
-            output = Path(summary['output_path']).resolve()
-            require(output.parent == parent.resolve() and output.is_dir(), 'Swift 未实际发布独立结果目录')
-            require(str(output) not in output_paths, 'Swift 复用了引擎直接转换的结果目录')
-            output_paths.add(str(output))
-            require({path.name for path in output.iterdir()} == {'java', 'proto'}, 'Swift 结果必须仅含 java/proto')
-            require(len(list((output / 'java').rglob('*.java'))) == result['java_count']
-                    and len(list((output / 'proto').rglob('*.proto'))) == result['proto_count'],
-                    'Swift 发布的实际文件数与转换结果不一致')
-            print(f'PASS Java {runtime}：搬移后的 Swift AppModel → 预检 → 转换完整链路，版本和 runtime 正确')
+        for language in ('java', 'objc'):
+            for runtime in RUNTIMES:
+                result = engine_request(engine, environment, parent, [source], 'proto',
+                                        f'bundle-proto-{language}-{runtime}', runtime, language)
+                require(result['proto_count'] == 1 and result['generated_count'] == (1 if language == 'java' else 2),
+                        '标准 protobuf 依赖不能导出为用户文件')
+                require(result['output_path'] not in output_paths, '不同转换复用了同一结果目录')
+                output_paths.add(result['output_path'])
+                print(f'PASS {language} {runtime} / {RUNTIMES[runtime]}：隔离 PATH/Python 环境后完成真实 Proto 转换')
+                if html is None:
+                    continue
+                result = engine_request(engine, environment, parent, [copied_html], 'html',
+                                        f'bundle-html-{language}-{runtime}', runtime, language)
+                require(result['output_path'] not in output_paths, '不同转换复用了同一结果目录')
+                output_paths.add(result['output_path'])
+                print(f'PASS {language} {runtime} HTML：{result["proto_count"]} Proto / {result["generated_count"]} 生成文件')
+                integration = command([relocated / 'Contents/MacOS/ProtoCompile', '--integration-test',
+                                       copied_html, parent, runtime, language], env=environment, cwd=folder)
+                summary = json.loads(integration.stdout)
+                require(summary.get('status') == 'passed', 'Swift 应用端到端转换失败')
+                for field in ('proto_count', 'java_count', 'objc_count', 'generated_count', 'output_language'):
+                    require(summary.get(field) == result.get(field), f'Swift 与引擎结果不一致：{field}')
+                require(summary.get('compiler_version') == RUNTIMES[runtime]
+                        and summary.get('runtime_version') == runtime, 'Swift 的编译器/运行库目标不符')
+                require(summary.get('application_version') == APP_VERSION
+                        and summary.get('application_build') == APP_BUILD, 'Swift 读取的应用版本不符')
+                output = verify_output(summary, parent, language)
+                require(str(output) not in output_paths, 'Swift 复用了引擎直接转换的结果目录')
+                output_paths.add(str(output))
+                print(f'PASS {language} {runtime}：搬移后的 Swift AppModel → 预检 → 转换完整链路，语言、版本和 runtime 正确')
         print(f'GAP 当前系统 {platform.mac_ver()[0]}；最低 macOS 13 的运行兼容性仍需该系统真机验收')
 
 

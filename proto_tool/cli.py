@@ -3,7 +3,7 @@ from pathlib import Path
 
 from . import ProtoError
 from .extract import write_sources
-from .service import ConversionError, ConversionRequest, compile_files, convert, output_transaction
+from .service import ConversionError, ConversionRequest, OUTPUT_LANGUAGES, compile_files, convert, output_transaction
 from .service import prepare_html as prepare_html_service
 from .toolchain import setup, RUNTIME_VERSION, TARGET_RUNTIMES
 
@@ -12,7 +12,7 @@ def prepare_html(source, args):
     sources, normalized, warnings, changes, excluded = prepare_html_service(
         source, exclude_opt_0081=not getattr(args, 'include_opt_0081', False),
         java_package='' if args.no_java_package else (args.java_package or ''),
-        repairs=args.repairs, no_repairs=args.no_repairs)
+        repairs=args.repairs, no_repairs=args.no_repairs, output_language=args.language)
     for item in excluded:
         print(f'已排除 {item}')
     for item in warnings:
@@ -27,6 +27,8 @@ def build(args):
     if not source.exists():
         raise ProtoError(f'输入不存在: {source}')
     html = source.is_file() and source.suffix.lower() in ('.html', '.htm')
+    if args.language == 'objc' and (args.java_package is not None or args.no_java_package):
+        raise ProtoError('--java-package/--no-java-package 仅用于 Java 输出')
     if (args.java_package is not None or args.no_java_package) and not html:
         raise ProtoError('--java-package/--no-java-package 仅用于 HTML；普通 proto 请在源文件设置 option java_package')
     if not html and (args.repairs or args.no_repairs):
@@ -39,32 +41,39 @@ def build(args):
         input_kind='html' if html else 'proto', input_paths=[source], include_paths=args.includes,
         destination=Path(args.output), protoc=args.protoc, exclude_opt_0081=not args.include_opt_0081,
         java_package='' if args.no_java_package else (args.java_package or ''),
-        repairs=args.repairs, no_repairs=args.no_repairs, target_runtime=args.target_runtime))
+        repairs=args.repairs, no_repairs=args.no_repairs, target_runtime=args.target_runtime,
+        output_language=args.language))
     for item in result.excluded:
         print(f'已排除 {item}')
     for item in result.changes:
         print(f'协议修正: {item}')
-    print(f'成功编译 {result.proto_count} 个 proto，生成 {result.java_count} 个 Java 文件: {result.output_path}')
+    language_label = 'Java' if result.output_language == 'java' else 'Objective-C'
+    print(f'成功编译 {result.proto_count} 个 proto，生成 {result.generated_count} 个 {language_label} 文件: {result.output_path}')
     print(f'编译器: {result.compiler_version}')
-    print(f'Java 运行库: com.google.protobuf:protobuf-java:{result.runtime_version}')
+    if result.output_language == 'java':
+        print(f'Java 运行库: com.google.protobuf:protobuf-java:{result.runtime_version}')
+    else:
+        print(f'Objective-C 运行库: Protobuf (CocoaPods) {result.runtime_version}')
     for item in result.warnings:
         print(f'警告: {item}')
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='从 TiddlyWiki 协议文档或 proto 文件生成 Java 源码')
+    parser = argparse.ArgumentParser(description='从 TiddlyWiki 协议文档或 proto 文件生成 Java 或 Objective-C 源码')
     commands = parser.add_subparsers(dest='command', required=True)
-    preparation = commands.add_parser('setup', help='准备并校验指定 Java 运行库的 protoc（macOS）')
-    preparation.add_argument('--target-runtime', choices=TARGET_RUNTIMES, default=RUNTIME_VERSION, help='目标 protobuf-java 版本，默认 3.25.9')
+    preparation = commands.add_parser('setup', help='准备并校验指定运行库的 protoc（macOS）')
+    preparation.add_argument('--target-runtime', choices=TARGET_RUNTIMES, default=RUNTIME_VERSION, help='目标 Protobuf 运行库版本，默认 3.25.9')
     extraction = commands.add_parser('extract', help='从 HTML 提取并规范化 proto，仅输出 .proto')
     extraction.add_argument('input')
     extraction.add_argument('-o', '--output', default='output/proto')
+    extraction.add_argument('--language', choices=OUTPUT_LANGUAGES, default='java', help='目标语言，默认 java')
     extraction.set_defaults(java_package=None, no_java_package=True, no_repairs=False, repairs=None)
     compilation = commands.add_parser('compile', help='编译 HTML、proto 文件或目录')
     compilation.add_argument('input')
-    compilation.add_argument('-o', '--output', default='output', help='输出根目录，默认 output；仅生成 java/ 和 proto/')
+    compilation.add_argument('--language', choices=OUTPUT_LANGUAGES, default='java', help='输出语言，默认 java')
+    compilation.add_argument('-o', '--output', default='output', help='输出根目录，默认 output；按语言生成 java/ 或 objc/，以及 proto/')
     compilation.add_argument('-I', '--proto-path', dest='includes', action='append', default=[])
-    compilation.add_argument('--protoc', help='指定与目标 Java 运行库版本匹配的 protoc 可执行文件')
-    compilation.add_argument('--target-runtime', choices=TARGET_RUNTIMES, default=RUNTIME_VERSION, help='目标 protobuf-java 版本，默认 3.25.9；可选 3.6.1 兼容模式')
+    compilation.add_argument('--protoc', help='指定与目标运行库版本匹配的 protoc 可执行文件')
+    compilation.add_argument('--target-runtime', choices=TARGET_RUNTIMES, default=RUNTIME_VERSION, help='目标 Protobuf 运行库版本，默认 3.25.9；可选 3.6.1 兼容模式')
     java_options = compilation.add_mutually_exclusive_group()
     java_options.add_argument('--java-package', help='显式设置 HTML 生成 Java 根包；默认不声明 Java 包名')
     java_options.add_argument('--no-java-package', action='store_true', help='HTML 生成 Java 不声明包名，跨文件引用使用类名')
