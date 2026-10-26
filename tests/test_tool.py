@@ -1,23 +1,39 @@
 import hashlib
+import gc
 import html
 import json
+import platform
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from unittest.mock import patch
 import zipfile
 
 from proto_tool import ProtoError
 from proto_tool.cli import output_transaction
 from proto_tool.extract import Source, extract, safe_name
-from proto_tool.normalize import normalize
+from proto_tool.normalize import Schema, normalize
 from proto_tool.repairs import repair_sources
 from proto_tool.toolchain import INSTALL, VERSION, RUNTIME_VERSION, find_protoc, unpack, verify_archive
 
 ROOT = Path(__file__).resolve().parent.parent
-PROTOC = INSTALL / 'bin' / 'protoc'
+PRIVATE_DOCUMENT = ROOT / 'device protocol v16.2.html'
+requires_private_document = unittest.skipUnless(PRIVATE_DOCUMENT.is_file(), '未提供本地私有协议文档')
+NATIVE_PROTOC = ROOT / '.tools' / 'native-protoc' / RUNTIME_VERSION / platform.machine() / 'bin' / 'protoc'
+PROTOC = NATIVE_PROTOC if NATIVE_PROTOC.is_file() else INSTALL / 'bin' / 'protoc'
+
+
+def compiler_available(path=PROTOC, version=VERSION):
+    if not path.is_file():
+        return False
+    try:
+        result = subprocess.run([str(path), '--version'], capture_output=True, text=True)
+        return result.returncode == 0 and result.stdout.strip() == 'libprotoc ' + version
+    except OSError:
+        return False
 
 
 def sources(**items):
@@ -66,14 +82,73 @@ class ExtractionTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtoError, '大小写冲突'):
             extract(self.wiki([('one', '// $(FILE)a.proto\nmessage A {}\n// $(FILE)A.proto\nmessage B {}')]))
 
+    @requires_private_document
     def test_actual_document(self):
         result = extract(ROOT / 'device protocol v16.2.html')
         self.assertEqual(sum(n.endswith('.proto') for n in result), 58)
         self.assertEqual(len(result['phone_book.proto'].titles), 2)
         self.assertIn('his_encrypt _medic_data.proto', result)
+        # 固定完整来源顺序、正文与标题，防止分块提取改变修正规则依赖的原始字节。
+        payload = [(name, source.text, source.titles) for name, source in result.items()]
+        digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(digest, '10a8232509d6db7a2f4ec80ddb9dec36c616611e385d23b9c3a9126dc7f8e6c3')
+
+    def test_streaming_entities_utf8_and_tags_at_chunk_boundaries(self):
+        path = self.root / '分块文档.html'
+        body = '// $(FILE)中文.proto\nsyntax="proto2"; // 中文 &lt; &#x1F600; &amp;\nmessage A {}'
+        path.write_text('x' * 8191 + '<div title="中文标题"><pre>' + body + '</pre></div>', encoding='utf-8-sig')
+        expected = html.unescape(body.split('\n', 1)[1]).strip() + '\n'
+        for chunk in (1, 2, 3, 5, 7, 31, 64, 8192):
+            with self.subTest(chunk=chunk), patch('proto_tool.extract.READ_CHUNK_SIZE', chunk):
+                result = extract(path)
+                self.assertEqual(list(result), ['中文.proto'])
+                self.assertEqual(result['中文.proto'].text, expected)
+                self.assertEqual(result['中文.proto'].titles, ['中文标题'])
+
+    def test_streaming_mixed_store_order_and_ignored_system_entries(self):
+        path = self.root / 'mixed.html'
+        body = '// $(FILE)a.proto\nsyntax="proto2"; // &amp; 中文\nmessage A {}'
+        store = json.dumps([{'title': 'JSON标题', 'text': body}, {'title': '$:/ignored', 'text': '// $(FILE)../bad.proto'}], ensure_ascii=False)
+        path.write_text('<div title="$:/system"><pre>// $(FILE)../bad.proto</pre></div>'
+                        '<div title="HTML标题"><pre>' + html.escape(body) + '</pre></div>'
+                        '<script class="tiddlywiki-tiddler-store" type="application/json">' + store + '</script>')
+        for chunk in (1, 7, 64):
+            with self.subTest(chunk=chunk), patch('proto_tool.extract.READ_CHUNK_SIZE', chunk):
+                result = extract(path)
+                self.assertEqual(result['a.proto'].text, body.split('\n', 1)[1] + '\n')
+                self.assertEqual(result['a.proto'].titles, ['HTML标题', 'JSON标题'])
+
+    def test_streaming_preserves_json_error_and_error_precedence(self):
+        path = self.root / 'invalid-store.html'
+        prefix = '<div title="非法路径"><pre>// $(FILE)../bad.proto</pre></div>'
+        for store in ('[', '[{"text": "missing title"}]'):
+            path.write_text(prefix + '<script class="tiddlywiki-tiddler-store" type="application/json">' + store + '</script>')
+            with self.subTest(store=store), patch('proto_tool.extract.READ_CHUNK_SIZE', 3):
+                with self.assertRaisesRegex(ProtoError, 'TiddlyWiki JSON 数据无效'):
+                    extract(path)
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_public_import_cycle_and_schema_release_without_gc(self):
+        items = sources(**{'a.proto': 'import public "b.proto"; message A {}',
+                           'b.proto': 'import public "a.proto"; message B { optional A a=1; }',
+                           'c.proto': 'import "a.proto"; message C { optional B b=1; }'})
+        references = []
+        def tracked(source):
+            schema = Schema(source)
+            references.append(weakref.ref(schema))
+            return schema
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with patch('proto_tool.normalize.Schema', side_effect=tracked):
+                normalized, _ = normalize(items)
+            self.assertIn('.device_protocol.b.B b', normalized['c.proto'].text)
+            self.assertTrue(all(reference() is None for reference in references))
+        finally:
+            if enabled:
+                gc.enable()
+
     def test_cross_file_local_shadow_and_comments(self):
         items = sources(**{'a.proto': 'message Shared {}', 'b.proto': 'import "a.proto"; message B { optional Shared item = 1; } // Shared\n', 'c.proto': 'import "a.proto"; message Shared {} message C { optional Shared item=1; }'})
         normalized, _ = normalize(items)
@@ -174,7 +249,7 @@ class SafetyTests(unittest.TestCase):
                 unpack(archive, Path(temp) / 'out')
 
     def test_missing_compiler(self):
-        with patch('proto_tool.toolchain.INSTALL', Path('/nonexistent-protoc-test')), patch('shutil.which', return_value=None):
+        with patch('proto_tool.toolchain.INSTALL', Path('/nonexistent-protoc-test')), patch('proto_tool.toolchain.ROOT', Path('/nonexistent-protoc-root')), patch('shutil.which', return_value=None):
             with self.assertRaisesRegex(ProtoError, '未找到 protoc'):
                 find_protoc()
         with self.assertRaisesRegex(ProtoError, '找不到指定'):
@@ -191,6 +266,21 @@ class SafetyTests(unittest.TestCase):
 
 
 class RepairTests(unittest.TestCase):
+    @requires_private_document
+    def test_complete_document_normalization_and_repairs_stay_identical(self):
+        original = extract(ROOT / 'device protocol v16.2.html')
+        selected = {name: source for name, source in original.items()
+                    if name.endswith('.proto') and name != 'his_encrypt_data.proto'}
+        repaired, repair_changes = repair_sources(selected)
+        normalized, changes = normalize(repaired, '')
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(digest([(name, item.text, item.titles) for name, item in normalized.items()]),
+                         '5c8119381dc48aa4505b5a87e11b7778ea363dfb6194008812ed228df1ca16a4')
+        self.assertEqual(digest(repair_changes), 'df3cba171575908b8751e7d76d0f2fdfb4e0cab7a32d94240476bdfa3db681bc')
+        self.assertEqual(digest(changes), 'c95a099c5e6b08c0737c359f3df9b55361af10a0531c45c55d370e6b8ec4591b')
+
+    @requires_private_document
     def test_known_missing_import_preserves_original(self):
         original = extract(ROOT / 'device protocol v16.2.html')
         repaired, changes = repair_sources(original)
@@ -223,7 +313,7 @@ class RepairTests(unittest.TestCase):
                     repair_sources({}, config, strict=True)
 
 
-@unittest.skipUnless(PROTOC.is_file(), '先运行 setup 以执行真实 protoc 集成测试')
+@unittest.skipUnless(compiler_available(), '需要当前架构可运行的 protoc 才能执行真实编译集成测试')
 class CompileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='proto test ')
@@ -274,6 +364,7 @@ class CompileTests(unittest.TestCase):
         self.assertIn('default=A_SAME', (self.root / 'out/proto/a.proto').read_text())
         self.assertFalse((self.root / 'out/original').exists())
 
+    @requires_private_document
     def test_document_excluding_opt_0081(self):
         result = self.call(ROOT / 'device protocol v16.2.html', '-o', self.root / 'out')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -287,10 +378,10 @@ class CompileTests(unittest.TestCase):
         self.assertTrue((self.root / 'out/proto/his_encrypt_health_data.proto').exists())
         self.assertTrue(all('device.protocol.' not in p.read_text() for p in generated))
 
-    def test_default_compiler_and_legacy_runtime_output(self):
+    def test_default_compiler_and_runtime_output(self):
         compiler, version = find_protoc()
         self.assertEqual(compiler, PROTOC.resolve())
-        self.assertEqual(version, 'libprotoc 3.11.0')
+        self.assertEqual(version, 'libprotoc ' + VERSION)
         source = self.root / 'sample.proto'
         source.write_text('syntax="proto2"; message Sample { optional int32 value=1; }')
         result = self.call(source, '-o', self.root / 'out')
@@ -307,6 +398,7 @@ class CompileTests(unittest.TestCase):
         self.assertIn('仅用于 HTML', result.stderr)
         self.assertFalse((self.root / 'out').exists())
 
+    @requires_private_document
     def test_document_without_java_package(self):
         result = self.call(ROOT / 'device protocol v16.2.html', '-o', self.root / 'out',
                            '--exclude-opt', 'OPT_0081', '--no-java-package')
@@ -319,6 +411,7 @@ class CompileTests(unittest.TestCase):
             self.assertNotRegex(text, r'(?m)^\s*package\s+')
         self.assertIn('RealtimeData.', (self.root / 'out/java/DeviceConf.java').read_text())
 
+    @requires_private_document
     def test_default_output_and_extract_are_clean(self):
         document = ROOT / 'device protocol v16.2.html'
         result = subprocess.run([sys.executable, str(ROOT / 'proto_compile.py'), 'compile', str(document)],
@@ -334,6 +427,31 @@ class CompileTests(unittest.TestCase):
         extracted = list((extraction / 'output/proto').iterdir())
         self.assertEqual(len(extracted), 57)
         self.assertTrue(all(p.suffix == '.proto' for p in extracted))
+
+
+LEGACY_PROTOC = ROOT / '.tools/native-protoc/3.6.1' / platform.machine() / 'bin/protoc'
+
+
+@unittest.skipUnless(compiler_available(LEGACY_PROTOC, '3.6.1'), '需要当前架构的 protoc 3.6.1 才能执行兼容模式真实编译')
+class LegacyCompileTests(unittest.TestCase):
+    def test_legacy_standalone_and_complete_document(self):
+        with tempfile.TemporaryDirectory(prefix='proto legacy ') as temp:
+            root = Path(temp)
+            source = root / 'sample.proto'
+            source.write_text('syntax="proto2"; message Sample { optional int32 value=1; }')
+            for index, (input_path, count) in enumerate(((source, 1), (ROOT / 'device protocol v16.2.html', 57))):
+                if input_path == PRIVATE_DOCUMENT and not PRIVATE_DOCUMENT.is_file():
+                    with self.subTest(input='private-document'):
+                        self.skipTest('未提供本地私有协议文档')
+                    continue
+                output = root / str(index)
+                result = subprocess.run([sys.executable, str(ROOT / 'proto_compile.py'), 'compile', str(input_path),
+                                         '--target-runtime', '3.6.1', '-o', str(output)], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('libprotoc 3.6.1', result.stdout)
+                self.assertIn('com.google.protobuf:protobuf-java:3.6.1', result.stdout)
+                self.assertEqual(len(list((output / 'proto').rglob('*.proto'))), count)
+                self.assertEqual(len(list((output / 'java').rglob('*.java'))), count)
 
 
 if __name__ == '__main__':

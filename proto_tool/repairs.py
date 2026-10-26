@@ -1,15 +1,17 @@
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 from . import ProtoError
 from .extract import Source, safe_name
 from .normalize import Schema
 
-DEFAULT_REPAIRS = Path(__file__).resolve().parent.parent / 'config' / 'device-v16.2-repairs.json'
+RESOURCE_ROOT = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
+DEFAULT_REPAIRS = RESOURCE_ROOT / 'config' / 'device-v16.2-repairs.json'
 
 
-def repair_sources(sources, config=DEFAULT_REPAIRS, strict=False):
+def repair_sources(sources, config=DEFAULT_REPAIRS, strict=False, warnings=None):
     try:
         rules = json.loads(Path(config).read_text(encoding='utf-8'))
         if not isinstance(rules, dict):
@@ -29,6 +31,8 @@ def repair_sources(sources, config=DEFAULT_REPAIRS, strict=False):
         if hashlib.sha256(source.text.encode('utf-8')).hexdigest() != rule['sha256']:
             if strict:
                 raise ProtoError(f'修正规则源文件校验不匹配: {name}')
+            if warnings is not None:
+                warnings.append(f'修正规则源文件校验不匹配，已跳过修正: {name}')
             continue
         schema = Schema(source)
         edits = []

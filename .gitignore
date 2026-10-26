@@ -5,6 +5,26 @@ __pycache__/
 .venv/
 .pytest_cache/
 
+# 私有协议输入及衍生文件，只保留在本机。
+*.[hH][tT][mM][lL]
+*.[hH][tT][mM]
+*.[pP][rR][oO][tT][oO]
+*.[pP][rR][oO][tT][oO][dD][eE][vV][eE][lL]
+*.options
+*.java
+!tests/JavaSmoke.java
+/private-inputs/
+
+# 本地凭据与签名私钥。
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.key
+*.mobileprovision
+
 # 可重新下载的工具链及可重新生成的编译产物
 .tools/
 output/
+dist/

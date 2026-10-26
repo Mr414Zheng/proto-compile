@@ -57,6 +57,8 @@ class Schema:
         self.parse_scope(())
         if self.syntax_end is None:
             self.fail('HTML 协议必须显式声明 syntax = "proto2" 或 "proto3"')
+        # 解析后仅枚举值与默认值还需要原 Token；其余 Token 不参与跨文件解析。
+        self.tokens.clear()
 
     def fail(self, message):
         token = self.tokens[min(self.index, len(self.tokens) - 1)] if self.tokens else None
@@ -211,18 +213,22 @@ def normalize(sources, java_package='device.protocol'):
             if dependency not in schemas:
                 raise ProtoError(f'{name} ({schema.source.titles}): 缺失 import {dependency}')
 
+    visible_cache = {}
+
     def visible_files(name):
+        if name in visible_cache:
+            return visible_cache[name]
         visible = {name}
-        def visit_public(dep):
+        pending = [dep for dep, _ in schemas[name].imports]
+        # 使用显式栈，避免递归闭包循环把整个 schemas 与 Token 保留到下一轮 GC。
+        while pending:
+            dep = pending.pop()
             if dep in visible:
-                return
+                continue
             visible.add(dep)
-            for child, modifier in schemas[dep].imports:
-                if modifier == 'public':
-                    visit_public(child)
-        for dep, _ in schemas[name].imports:
-            visit_public(dep)
-        return visible
+            pending.extend(child for child, modifier in schemas[dep].imports if modifier == 'public')
+        visible_cache[name] = tuple(sorted(visible))
+        return visible_cache[name]
 
     def resolve(name, reference):
         # 本地词法作用域优先；导入文件仅在可见集合内参与解析，不做全局猜测。
@@ -236,7 +242,7 @@ def normalize(sources, java_package='device.protocol'):
             candidate = prefix + parts
             matches = []
             shadowed = []
-            for dep in sorted(visible):
+            for dep in visible:
                 dep_schema = schemas[dep]
                 dep_prefix = tuple(dep_schema.package.split('.')) if dep_schema.package else ()
                 if candidate[:len(dep_prefix)] == dep_prefix:

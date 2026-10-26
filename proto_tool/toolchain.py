@@ -1,12 +1,9 @@
 import hashlib
-import os
 import platform
 import shutil
 import stat
 import subprocess
-import tempfile
-import urllib.request
-import zipfile
+import sys
 from pathlib import Path
 
 from . import ProtoError
@@ -14,20 +11,29 @@ from .extract import safe_name
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = '3.11.0'
-RUNTIME_VERSION = '3.11.0'
-INSTALL = ROOT / '.tools' / ('protoc-' + VERSION)
-# 3.11.0 没有 macOS ARM 包；Apple Silicon 通过 Rosetta 运行同一 Intel 包。
-# 此旧版发布页没有提供摘要，以下 SHA-256 固定自官方 HTTPS 下载的安装包。
-ASSETS = {
-    'arm64': ('osx-x86_64', 'd35dfbb430cd242eb0405557c7e189c68abb1d85b11674bf8b302ed6c6360646'),
-    'x86_64': ('osx-x86_64', 'd35dfbb430cd242eb0405557c7e189c68abb1d85b11674bf8b302ed6c6360646'),
-}
+VERSION = '25.9'
+RUNTIME_VERSION = '3.25.9'
+COMPILER_VERSIONS = {'3.25.9': '25.9', '3.6.1': '3.6.1'}
+TARGET_RUNTIMES = tuple(COMPILER_VERSIONS)
+INSTALL = ROOT / '.tools' / 'native-protoc' / RUNTIME_VERSION / platform.machine()
 
 
-def run(command, cwd=None):
+def validate_target_runtime(target_runtime):
+    if target_runtime not in TARGET_RUNTIMES:
+        raise ProtoError(f'不支持的 Java 运行库版本: {target_runtime!r}；请选择 3.25.9 或 3.6.1')
+    return target_runtime
+
+
+def native_protoc(target_runtime):
+    return ROOT / '.tools' / 'native-protoc' / target_runtime / platform.machine() / 'bin' / 'protoc'
+
+
+def run(command, cwd=None, cancellation=None):
     try:
-        result = subprocess.run([str(x) for x in command], cwd=cwd, capture_output=True, text=True)
+        if cancellation is None:
+            result = subprocess.run([str(x) for x in command], cwd=cwd, capture_output=True, text=True)
+        else:
+            result = cancellation.run([str(x) for x in command], cwd=cwd)
     except OSError as exc:
         raise ProtoError(f'无法运行 {command[0]}: {exc}') from exc
     if result.returncode:
@@ -42,6 +48,8 @@ def verify_archive(archive, expected):
 
 
 def unpack(archive, directory):
+    import zipfile
+
     with zipfile.ZipFile(archive) as bundle:
         for info in bundle.infolist():
             safe_name(info.filename.rstrip('/'))
@@ -50,51 +58,47 @@ def unpack(archive, directory):
         bundle.extractall(directory)
 
 
-def setup():
-    if platform.system() != 'Darwin' or platform.machine() not in ASSETS:
-        raise ProtoError('自动安装仅支持 macOS arm64/x86_64；其他平台请安装 protoc 并通过 --protoc 指定')
-    executable = INSTALL / 'bin' / 'protoc'
-    if INSTALL.exists():
-        if executable.is_file() and run([executable, '--version']).stdout.strip() == 'libprotoc ' + VERSION:
-            return executable
-        raise ProtoError(f'已有安装不完整或版本不符，请移走后重试: {INSTALL}')
-    INSTALL.parent.mkdir(parents=True, exist_ok=True)
-    asset, checksum = ASSETS[platform.machine()]
-    url = f'https://github.com/protocolbuffers/protobuf/releases/download/v{VERSION}/protoc-{VERSION}-{asset}.zip'
-    with tempfile.TemporaryDirectory(prefix='protoc-setup-', dir=INSTALL.parent) as temp:
-        temp = Path(temp)
-        archive = temp / 'protoc.zip'
-        try:
-            with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as target:
-                shutil.copyfileobj(response, target)
-        except OSError as exc:
-            raise ProtoError(f'下载 protoc 失败: {exc}') from exc
-        verify_archive(archive, checksum)
-        contents = temp / 'contents'
-        unpack(archive, contents)
-        binary = contents / 'bin' / 'protoc'
-        binary.chmod(binary.stat().st_mode | 0o111)
-        if run([binary, '--version']).stdout.strip() != 'libprotoc ' + VERSION:
-            raise ProtoError('下载的 protoc 版本不符')
-        os.rename(contents, INSTALL)
-    return executable
+def setup(target_runtime=RUNTIME_VERSION):
+    """通过项目 bootstrap 准备指定运行库对应的原生工具链。"""
+    validate_target_runtime(target_runtime)
+    if getattr(sys, 'frozen', False):
+        return find_protoc(target_runtime=target_runtime)[0]
+    if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'x86_64'):
+        raise ProtoError('自动准备工具链仅支持 macOS arm64/x86_64；其他平台请通过 --protoc 指定匹配版本的编译器')
+    native = native_protoc(target_runtime)
+    if not native.is_file():
+        bootstrap = ROOT / 'scripts' / 'bootstrap.py'
+        if not bootstrap.is_file():
+            raise ProtoError('找不到工具链准备脚本 scripts/bootstrap.py，请重新获取完整项目')
+        run([sys.executable, bootstrap, '--target-runtime', target_runtime, '--arch', platform.machine()])
+    return find_protoc(native, target_runtime=target_runtime)[0]
 
 
-def find_protoc(explicit=None):
-    if explicit:
+def find_protoc(explicit=None, cancellation=None, target_runtime=RUNTIME_VERSION):
+    validate_target_runtime(target_runtime)
+    native = native_protoc(target_runtime)
+    if getattr(sys, 'frozen', False):
+        # 冻结应用必须自包含，不能误用用户 PATH 中版本不兼容的编译器。
+        candidate = Path(sys._MEIPASS) / 'toolchains' / target_runtime / 'bin' / 'protoc'
+        if not candidate.is_file():
+            raise ProtoError(f'应用内置 protoc 缺失（Java 运行库 {target_runtime}），请重新安装应用')
+    elif explicit:
         candidate = Path(explicit).expanduser()
         if not candidate.is_file():
-            found = shutil.which(explicit)
+            found = shutil.which(str(explicit))
             if not found:
                 raise ProtoError(f'找不到指定的 protoc: {explicit}')
             candidate = Path(found)
-    elif (INSTALL / 'bin' / 'protoc').is_file():
-        candidate = INSTALL / 'bin' / 'protoc'
+    elif native.is_file():
+        candidate = native
     else:
         found = shutil.which('protoc')
         if not found:
-            raise ProtoError('未找到 protoc；请先运行 python3 proto_compile.py setup，或使用 --protoc 指定路径')
+            raise ProtoError(f'未找到 protoc；请先运行 python3 proto_compile.py setup --target-runtime {target_runtime}，或使用 --protoc 指定匹配编译器')
         candidate = Path(found)
     candidate = candidate.resolve()
-    version = run([candidate, '--version']).stdout.strip()
+    version = run([candidate, '--version'], cancellation=cancellation).stdout.strip()
+    expected = 'libprotoc ' + COMPILER_VERSIONS[target_runtime]
+    if version != expected:
+        raise ProtoError(f'编译器与 Java 运行库版本不匹配：目标 protobuf-java {target_runtime} 需要 {expected}，实际为 {version or "未知版本"}。请准备对应工具链或调整 --target-runtime')
     return candidate, version

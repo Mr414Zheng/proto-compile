@@ -35,7 +35,9 @@ def main():
         argfile = temp / 'sources.txt'
         argfile.write_text('\n'.join('"' + str(p).replace('\\', '\\\\').replace('"', '\\"') + '"' for p in sources), encoding='utf-8')
         subprocess.run([str(javac), '-encoding', 'UTF-8', '-cp', str(args.runtime_jar.resolve()), '-d', str(classes), '@' + str(argfile)], check=True)
-        subprocess.run([str(java), '-cp', str(classes) + ':' + str(args.runtime_jar.resolve()), 'JavaSmoke'], check=True)
+        # 新运行库须拒绝仍使用旧生成器易受攻击路径的代码；旧运行库会忽略此属性。
+        subprocess.run([str(java), '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true',
+                        '-cp', str(classes) + ':' + str(args.runtime_jar.resolve()), 'JavaSmoke'], check=True)
         print(f'PASS: {len(generated)} generated Java files compiled with {version}')
 
 

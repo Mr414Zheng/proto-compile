@@ -6,6 +6,8 @@ from pathlib import PurePosixPath
 
 from . import ProtoError
 
+READ_CHUNK_SIZE = 64 * 1024
+
 
 @dataclass
 class Source:
@@ -15,9 +17,10 @@ class Source:
 
 
 class WikiParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, on_item=None):
         super().__init__(convert_charrefs=True)
         self.items = []
+        self.on_item = on_item
         self.depth = 0
         self.active = None
         self.pre = False
@@ -37,7 +40,7 @@ class WikiParser(HTMLParser):
             self.json_parts = []
 
     def handle_data(self, data):
-        if self.active and self.pre:
+        if self.active and self.pre and (self.on_item is None or not self.active[1].startswith('$:/')):
             self.parts.append(data)
         if self.json_parts is not None:
             self.json_parts.append(data)
@@ -47,17 +50,24 @@ class WikiParser(HTMLParser):
             self.pre = False
         if tag == 'div':
             if self.active and self.depth == self.active[0]:
-                self.items.append((self.active[1], ''.join(self.parts)))
+                self.add_item(self.active[1], ''.join(self.parts))
                 self.active = None
+                self.parts = []
             self.depth -= 1
         if tag == 'script' and self.json_parts is not None:
             try:
                 for item in json.loads(''.join(self.json_parts)):
-                    self.items.append((item['title'], item.get('text', '')))
+                    self.add_item(item['title'], item.get('text', ''))
             except (ValueError, TypeError, KeyError) as exc:
                 raise ProtoError(f'TiddlyWiki JSON 数据无效: {exc}') from exc
             finally:
                 self.json_parts = None
+
+    def add_item(self, title, body):
+        if self.on_item is None:
+            self.items.append((title, body))
+        else:
+            self.on_item(title, body)
 
 
 def safe_name(name):
@@ -70,13 +80,13 @@ def safe_name(name):
 
 
 def extract(path):
-    parser = WikiParser()
-    parser.feed(path.read_text(encoding='utf-8-sig'))
     sources = {}
     marker = re.compile(r'(?m)^[ \t]*//[ \t]*\$\(FILE\)([^\r\n]+)[ \t]*$')
-    for title, body in parser.items:
+    extraction_error = None
+
+    def collect(title, body):
         if title.startswith('$:/'):
-            continue
+            return
         matches = list(marker.finditer(body))
         for index, match in enumerate(matches):
             name = match[1].strip()
@@ -91,6 +101,25 @@ def extract(path):
                 sources[name].titles.append(title)
             else:
                 sources[name] = Source(name, content, [title])
+
+    def consume(title, body):
+        nonlocal extraction_error
+        if extraction_error is not None:
+            return
+        try:
+            collect(title, body)
+        except ProtoError as exc:
+            # 完成 HTML/JSON 解析后再报告声明错误，保留原有错误优先顺序。
+            extraction_error = exc
+
+    parser = WikiParser(on_item=consume)
+    # 文本解码器处理跨块 UTF-8，HTMLParser 保留尚未完整的标签和实体。
+    # 每个条目结束即提取，避免整页文本、实体展开结果和所有条目正文同时驻留。
+    with path.open(encoding='utf-8-sig') as source:
+        while chunk := source.read(READ_CHUNK_SIZE):
+            parser.feed(chunk)
+    if extraction_error is not None:
+        raise extraction_error
     if not any(n.endswith('.proto') for n in sources):
         raise ProtoError('文档中未找到带 $(FILE) 标记的 proto 声明')
     folded = {}
