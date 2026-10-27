@@ -4,6 +4,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from proto_tool import ProtoError
 from proto_tool.ble_schema import load_protocol
@@ -29,6 +30,15 @@ def blob(tag, value):
 
 def frame(opcode, payload):
     return (b'DT' + struct.pack('<HHH', len(payload), crc16(payload), opcode) + payload).hex().upper()
+
+
+def reference_crc16(payload):
+    crc = 0
+    for value in payload:
+        crc ^= value << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
 
 
 class DecoderTests(unittest.TestCase):
@@ -132,6 +142,54 @@ class DecoderTests(unittest.TestCase):
         self.assertFalse(validation['length_valid'])
         self.assertFalse(validation['crc_valid'])
         self.assertEqual(result.structure['data']['value'], True)
+
+    def test_crc_known_vectors_and_reference_equivalence(self):
+        self.assertEqual(crc16(b''), 0)
+        self.assertEqual(crc16(b'123456789'), 0x31C3)
+        self.assertEqual(crc16(bytes(range(256))), 0x7E55)
+        for size in (1, 2, 7, 8, 31, 255, 256, 1024, 65536):
+            payload = bytes((index * 73 + index // 7) % 256 for index in range(size))
+            with self.subTest(size=size):
+                self.assertEqual(crc16(payload), reference_crc16(payload))
+
+    def test_hex_validation_retains_exact_errors_and_size_priority(self):
+        schema = self.schema('message PeerInfoSubsriber {}')
+        cases = ('0', '0Z', '00 00', '0x00', '００', '00\n00', '00\t00',
+                 '0' * 9, '0' * 8 + 'G0', '0' * 25, '0' * 24 + 'G0')
+        for log_format, label in (('json', 'sentence '), ('frames', '完整帧')):
+            for value in cases:
+                source = json.dumps(dict(id=1, name='up', sentence=value)) if log_format == 'json' else value
+                with self.subTest(log_format=log_format, value=value), patch('proto_tool.ble_decoder.MAX_PAYLOAD_BYTES', 4):
+                    result = decode_line(source, log_format, schema)
+                self.assertEqual(result.original_hex, value)
+                self.assertEqual(result.structure['source_text'], source)
+                self.assertEqual(result.structure['parse_error'], [
+                    f'输入记录无效: {label}必须是偶数个十六进制字符，不能含空格或 0x 前缀'
+                ])
+
+        for log_format, value, message in (
+            ('json', '00' * 5, 'payload 超过安全大小限制'),
+            ('frames', '00' * 13, '完整帧超过安全大小限制'),
+            ('frames', '', '完整帧必须是偶数个十六进制字符，不能含空格或 0x 前缀'),
+        ):
+            source = json.dumps(dict(id=1, name='up', sentence=value)) if log_format == 'json' else value
+            with self.subTest(log_format=log_format, value=value), patch('proto_tool.ble_decoder.MAX_PAYLOAD_BYTES', 4):
+                result = decode_line(source, log_format, schema)
+            self.assertEqual(result.structure['parse_error'], ['输入记录无效: ' + message])
+
+    def test_hex_accepts_empty_json_mixed_case_and_exact_size_limits(self):
+        schema = self.schema('message PeerInfoSubsriber { optional bytes value=1; }')
+        for payload in (b'', bytes.fromhex('0A02aAbB')):
+            value = payload.hex().replace('aa', 'aA').replace('bb', 'Bb')
+            source = json.dumps(dict(id=1, name='up', sentence=value))
+            with self.subTest(payload=payload), patch('proto_tool.ble_decoder.MAX_PAYLOAD_BYTES', 4):
+                result = decode_line(source, 'json', schema)
+                framed = decode_line(frame(1, payload).lower(), 'frames', schema)
+            self.assertEqual(result.status, 'decoded')
+            self.assertEqual(result.original_hex, value)
+            self.assertNotIn('parse_error', framed.structure)
+            self.assertTrue(framed.structure['frame_validation']['crc_valid'])
+            self.assertEqual(result.structure['data'], framed.structure['data'])
 
     def test_truncation_invalid_varints_utf8_and_partial_fields(self):
         schema = self.schema('message PeerInfoSubsriber {optional bool first=1; optional string text=2; optional uint64 big=3;}')

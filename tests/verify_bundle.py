@@ -18,8 +18,8 @@ MACHO_MAGICS = {bytes.fromhex(value) for value in (
     'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca',
 )}
 RUNTIMES = {'3.25.9': 'libprotoc 25.9', '3.6.1': 'libprotoc 3.6.1'}
-APP_VERSION = '1.4.0'
-APP_BUILD = '6'
+APP_VERSION = '1.4.1'
+APP_BUILD = '7'
 
 
 def require(condition, message):

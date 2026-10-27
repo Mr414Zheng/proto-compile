@@ -8,6 +8,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var quitting = false
     private var performanceDriver: PerformanceDriver?
+    private var blePerformanceDriver: BlePerformanceDriver?
+    private lazy var workspaceState = WorkspaceState(model: model, bleModel: bleModel)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMenu()
@@ -24,13 +26,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do { performanceDriver = try PerformanceDriver(model: model, arguments: args) }
             catch { fputs("Performance setup failed: \(error)\n", stderr); exit(2) }
         }
+        if args.contains("--ble-performance-test") {
+            do { blePerformanceDriver = try BlePerformanceDriver(model: model, ble: bleModel, arguments: args, selectMode: { [weak self] in self?.workspaceState.mode = $0 }) }
+            catch { fputs("BLE performance setup failed: \(error)\n", stderr); exit(2) }
+        }
         let window = makeWindow()
         self.window = window
-        if performanceDriver != nil { window.setContentSize(NSSize(width: 820, height: 800)); window.center() }
+        if performanceDriver != nil || blePerformanceDriver != nil { window.setContentSize(NSSize(width: 820, height: 800)); window.center() }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         model.loadVersion()
         performanceDriver?.start()
+        blePerformanceDriver?.start()
     }
 
     private func makeWindow() -> NSWindow {
@@ -38,7 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "Proto Compile"
         window.minSize = NSSize(width: 760, height: 740)
         let previewBLE = CommandLine.arguments.contains("--render-preview") && ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_WORKFLOW"] == "ble"
-        window.contentView = NSHostingView(rootView: WorkspaceView(model: model, bleModel: bleModel, initialMode: previewBLE ? 1 : 0))
+        if previewBLE { workspaceState.mode = 1 }
+        window.contentView = NSHostingView(rootView: WorkspaceView(model: model, bleModel: bleModel, state: workspaceState))
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false

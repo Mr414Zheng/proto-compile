@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +83,7 @@ def decode_logs(request, event=None, cancellation=None):
     warnings = list(schema.warnings[:MAX_WARNINGS])
     counts = dict(decoded=0, warning=0, error=0)
     record_count = 0
+    last_decoding_progress = None
     name = re.sub(r'[\x00-\x1f/\\:]', '_', log.stem)[:80] or '蓝牙日志'
     report_name = f'{name}-解析.txt'
     destination = parent / f'蓝牙日志解析-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex}'
@@ -127,8 +129,10 @@ def decode_logs(request, event=None, cancellation=None):
                     output.write(json.dumps(record.structure, ensure_ascii=False, indent=2, allow_nan=False))
                     if record.status != 'decoded' and len(warnings) < MAX_WARNINGS:
                         warnings.append(f'第 {line_number} 行含有' + ('错误' if record.status == 'error' else '解析提示') + '，已保留在 TXT 结果中。')
-                    if record_count == 1 or record_count % 100 == 0:
+                    now = time.monotonic()
+                    if last_decoding_progress is None or now - last_decoding_progress >= 0.100:
                         progress('decoding', f'已解析 {record_count} 条记录…', processed=record_count)
+                        last_decoding_progress = now
                 if not record_count:
                     raise ConversionError('日志文件为空或只包含空行。', 'EMPTY_INPUT',
                                           '请选择包含蓝牙数据的日志文件。', file=str(log))

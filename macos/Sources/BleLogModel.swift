@@ -2,6 +2,23 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 
+struct BleProgressState: Equatable {
+    var stage = "等待导入"
+    var stageDetail = "请选择日志文件、设备协议 HTML 文档和导出父目录。"
+    var processed: Int?
+    var total: Int?
+}
+
+@MainActor
+final class BleProgressModel: ObservableObject {
+    @Published private(set) var state = BleProgressState()
+
+    func update(_ state: BleProgressState) {
+        guard self.state != state else { return }
+        self.state = state
+    }
+}
+
 @MainActor
 final class BleLogModel: ObservableObject {
     enum LogFormat: String, CaseIterable {
@@ -20,19 +37,25 @@ final class BleLogModel: ObservableObject {
     @Published private(set) var outputParent: String?
     @Published private(set) var isParsing = false
     @Published private(set) var isCancelling = false
-    @Published private(set) var stage = "等待导入"
-    @Published private(set) var stageDetail = "请选择日志文件、设备协议 HTML 文档和导出父目录。"
-    @Published private(set) var processed: Int?
-    @Published private(set) var total: Int?
+    let progress = BleProgressModel()
+    var stage: String { progress.state.stage }
+    var stageDetail: String { progress.state.stageDetail }
+    var processed: Int? { progress.state.processed }
+    var total: Int? { progress.state.total }
     @Published private(set) var result: EngineMessage?
     @Published private(set) var failure: EngineFailure?
     private let engineExecutable: URL?
     private var activeID: String?
     @Published private var liveRuns: [String: EngineRun] = [:]
     private var shutdownCompletion: (() -> Void)?
-    private var shuttingDown = false
+    @Published private var shuttingDown = false
 
     init(engineExecutable: URL? = nil) { self.engineExecutable = engineExecutable }
+
+    var busyPublisher: AnyPublisher<Bool, Never> {
+        Publishers.CombineLatest3($isParsing, $liveRuns, $shuttingDown)
+            .map { $0 || !$1.isEmpty || $2 }.removeDuplicates().eraseToAnyPublisher()
+    }
 
     var canParse: Bool { logPath != nil && protocolPath != nil && outputParent != nil && !isParsing && !shuttingDown && liveRuns.isEmpty }
     var busy: Bool { isParsing || !liveRuns.isEmpty || shuttingDown }
@@ -64,10 +87,9 @@ final class BleLogModel: ObservableObject {
     private func parametersChanged() {
         result = nil
         failure = nil
-        processed = nil
-        total = nil
-        stage = canParse ? "准备就绪" : "等待导入"
-        stageDetail = canParse ? "将按所选协议逐条解析，并导出 UTF-8 文本。" : "请选择日志文件、设备协议 HTML 文档和导出父目录。"
+        progress.update(BleProgressState(
+            stage: canParse ? "准备就绪" : "等待导入",
+            stageDetail: canParse ? "将按所选协议逐条解析，并导出 UTF-8 文本。" : "请选择日志文件、设备协议 HTML 文档和导出父目录。"))
     }
 
     func chooseLog() {
@@ -138,17 +160,14 @@ final class BleLogModel: ObservableObject {
         guard !busy else { return }
         result = nil
         failure = validatePaths()
-        if let failure { stage = failure.title; stageDetail = failure.suggestion; return }
+        if let failure { updateStatus(failure.title, failure.suggestion); return }
         let id = UUID().uuidString
         let run = engineExecutable.map { EngineRun(executable: $0) } ?? EngineRun()
         activeID = id
         liveRuns[id] = run
         isParsing = true
         isCancelling = false
-        processed = nil
-        total = nil
-        stage = "正在解析日志"
-        stageDetail = "正在启动本地解析引擎…"
+        progress.update(BleProgressState(stage: "正在解析日志", stageDetail: "正在启动本地解析引擎…"))
         var request = EngineRequest(task_id: id, action: "decode_ble", input_kind: "html", input_paths: [protocolPath!], include_paths: [], output_parent: outputParent, exclude_opt_0081: false, target_runtime: AppModel.TargetRuntime.current.rawValue)
         request.log_path = logPath
         request.log_format = logFormat.rawValue
@@ -163,10 +182,10 @@ final class BleLogModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.activeID == id, !self.isCancelling else { return }
                 let stages = ["reading": "读取日志", "parsing": "解析设备协议", "decoding": "解码蓝牙记录", "exporting": "导出解析结果"]
-                self.stage = stages[message.stage ?? ""] ?? "正在解析日志"
-                self.stageDetail = message.message_zh ?? "正在处理，请稍候。"
-                self.processed = message.processed
-                self.total = message.total
+                self.progress.update(BleProgressState(
+                    stage: stages[message.stage ?? ""] ?? "正在解析日志",
+                    stageDetail: message.message_zh ?? "正在处理，请稍候。",
+                    processed: message.processed, total: message.total))
             }
         }) { [weak self] response in
             Task { @MainActor in
@@ -179,31 +198,34 @@ final class BleLogModel: ObservableObject {
                 switch response {
                 case .success(let message) where message.type == "result":
                     self.result = message
-                    self.stage = "解析完成"
-                    self.stageDetail = "共 \(message.record_count ?? 0) 条：成功 \(message.decoded_count ?? 0) 条，含警告 \(message.warning_count ?? 0) 条，错误 \(message.error_count ?? 0) 条。"
+                    self.updateStatus("解析完成", "共 \(message.record_count ?? 0) 条：成功 \(message.decoded_count ?? 0) 条，含警告 \(message.warning_count ?? 0) 条，错误 \(message.error_count ?? 0) 条。")
                 case .success(let message):
                     var details = "错误代码：\(message.code ?? "UNKNOWN")"
                     if let file = message.file { details += "\n文件：\(file)" }
                     if let line = message.line { details += "\n行号：\(line)" }
                     if let context = message.details { details += "\n\(context)" }
                     self.failure = EngineFailure(title: message.message_zh ?? "蓝牙日志解析失败", suggestion: message.suggestion ?? "请检查日志格式、设备协议和导出目录后重试。", details: details)
-                    self.stage = message.code == "CANCELLED" ? "解析已取消" : "解析失败"
-                    self.stageDetail = self.failure!.suggestion
+                    self.updateStatus(message.code == "CANCELLED" ? "解析已取消" : "解析失败", self.failure!.suggestion)
                 case .failure(let failure):
                     self.failure = EngineFailure(title: failure.title.replacingOccurrences(of: "转换", with: "解析"), suggestion: failure.suggestion.replacingOccurrences(of: "转换", with: "解析"), details: failure.details)
-                    self.stage = self.failure!.title
-                    self.stageDetail = self.failure!.suggestion
+                    self.updateStatus(self.failure!.title, self.failure!.suggestion)
                 }
                 self.finishShutdownIfNeeded()
             }
         }
     }
 
+    private func updateStatus(_ stage: String, _ detail: String) {
+        var state = progress.state
+        state.stage = stage
+        state.stageDetail = detail
+        progress.update(state)
+    }
+
     func cancel() {
         guard isParsing, !isCancelling, let id = activeID else { return }
         isCancelling = true
-        stage = "正在取消解析"
-        stageDetail = "正在等待解析引擎停止并清理临时文件…"
+        updateStatus("正在取消解析", "正在等待解析引擎停止并清理临时文件…")
         liveRuns[id]?.cancel()
     }
 
@@ -254,18 +276,13 @@ final class BleLogModel: ObservableObject {
                                    report_path: "/Users/developer/Exports/BLE-20261027/蓝牙日志解析.txt",
                                    record_count: 128, decoded_count: 124, warning_count: 3, error_count: 1,
                                    warnings: ["第 17 条含未知字段，已保留原始编码供核对。", "第 83 条 payload 不完整，已保留原始内容和错误位置。"])
-            stage = "解析完成"
-            stageDetail = "共 128 条：成功 124 条，含警告 3 条，错误 1 条。"
+            updateStatus("解析完成", "共 128 条：成功 124 条，含警告 3 条，错误 1 条。")
         } else if state == "error" {
             failure = EngineFailure(title: "无法读取设备协议文档", suggestion: "请重新选择可读取的 HTML 协议文档，并检查文件访问权限。", details: "错误代码：FILE_NOT_FOUND\n文件：\(protocolPath!)")
-            stage = "解析失败"
-            stageDetail = failure!.suggestion
+            updateStatus("解析失败", failure!.suggestion)
         } else if state == "busy" {
             isParsing = true
-            processed = 76
-            total = 128
-            stage = "解码蓝牙记录"
-            stageDetail = "正在按设备协议逐条解码，并保留异常记录。"
+            progress.update(BleProgressState(stage: "解码蓝牙记录", stageDetail: "正在按设备协议逐条解码，并保留异常记录。", processed: 76, total: 128))
         }
     }
 }

@@ -1,5 +1,6 @@
 """保留来源及部分结果的 BLE 单行解码器。"""
 
+import binascii
 import json
 import math
 import re
@@ -11,7 +12,7 @@ from .ble_schema import ProtocolSchema, Type
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_DEPTH = 32
 MAX_FIELDS = 100000
-_HEX = re.compile(r'(?:[0-9a-fA-F]{2})*\Z')
+_HEX = re.compile(r'[0-9a-fA-F]*\Z')
 _VARINT = {'int32', 'int64', 'uint32', 'uint64', 'sint32', 'sint64', 'bool'}
 _FIXED32 = {'fixed32', 'sfixed32', 'float'}
 _FIXED64 = {'fixed64', 'sfixed64', 'double'}
@@ -41,12 +42,7 @@ class _WireError(ValueError):
 
 def crc16(payload: bytes) -> int:
     """协议 CRC-16：初值 0，多项式 0x1021，覆盖 payload。"""
-    crc = 0
-    for value in payload:
-        crc ^= value << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
+    return binascii.crc_hqx(payload, 0)
 
 
 def _varint(payload, offset):
@@ -267,11 +263,11 @@ def decode_line(line: str, log_format: str, schema: ProtocolSchema) -> DecodedRe
             envelope['opcode'] = f'0x{opcode:04X}'
             if obj.get('name') not in ('up', 'down'): raise ValueError('name 必须是 up 或 down')
             envelope['direction'] = obj['name']
-            if not _HEX.fullmatch(sentence): raise ValueError('sentence 必须是偶数个十六进制字符，不能含空格或 0x 前缀')
+            if len(sentence) % 2 or not _HEX.fullmatch(sentence): raise ValueError('sentence 必须是偶数个十六进制字符，不能含空格或 0x 前缀')
             if len(sentence) > MAX_PAYLOAD_BYTES * 2: raise ValueError('payload 超过安全大小限制')
             payload = bytes.fromhex(sentence)
         elif log_format == 'frames':
-            if not text or not _HEX.fullmatch(text): raise ValueError('完整帧必须是偶数个十六进制字符，不能含空格或 0x 前缀')
+            if not text or len(text) % 2 or not _HEX.fullmatch(text): raise ValueError('完整帧必须是偶数个十六进制字符，不能含空格或 0x 前缀')
             if len(text) > (MAX_PAYLOAD_BYTES + 8) * 2: raise ValueError('完整帧超过安全大小限制')
             frame = bytes.fromhex(text)
             if len(frame) < 8: raise ValueError('完整帧不足 8 字节帧头')

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from proto_tool.ble_decoder import decode_line
 from proto_tool.ble_service import BleDecodeRequest, decode_logs
 from proto_tool.engine import main, parse_request
 from proto_tool.service import CancellationToken, Cancelled, ConversionError
@@ -98,6 +99,53 @@ class BleServiceTests(unittest.TestCase):
                 token.cancel()
         with self.assertRaises(Cancelled):
             decode_logs(self.request(), event=event, cancellation=token)
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_decoding_progress_uses_elapsed_time_and_finishes_immediately(self):
+        self.log.write_text((json_line() + '\n') * 6, encoding='utf-8')
+        events = []
+        with patch('proto_tool.ble_service.time.monotonic', side_effect=[0, 0.099, 0.100, 0.101, 0.199, 0.200]) as clock:
+            result = decode_logs(self.request(), event=lambda **fields: events.append(fields))
+        self.assertEqual(clock.call_count, 6)
+        self.assertEqual([fields['stage'] for fields in events], [
+            'parsing', 'reading', 'decoding', 'decoding', 'decoding', 'exporting'
+        ])
+        self.assertEqual([fields['processed'] for fields in events if fields['stage'] == 'decoding'], [1, 3, 6])
+        self.assertEqual(events[-1], dict(stage='exporting', message_zh='正在保存解析结果…', processed=6, total=6))
+        self.assertEqual(result.record_count, 6)
+
+    def test_fast_records_suppress_count_based_progress_but_preserve_terminal_event(self):
+        self.log.write_text((json_line() + '\n') * 201, encoding='utf-8')
+        events = []
+        with patch('proto_tool.ble_service.time.monotonic', return_value=42) as clock:
+            result = decode_logs(self.request(), event=lambda **fields: events.append(fields))
+        self.assertEqual(clock.call_count, 201)
+        self.assertEqual([fields['processed'] for fields in events if fields['stage'] == 'decoding'], [1])
+        self.assertEqual(events[-1]['stage'], 'exporting')
+        self.assertEqual((events[-1]['processed'], events[-1]['total']), (201, 201))
+        self.assertEqual(len(self.read_records(result.report_path)), 201)
+
+    def test_cancellation_is_checked_for_each_record_with_progress_suppressed(self):
+        self.log.write_text((json_line() + '\n') * 10, encoding='utf-8')
+        token = CancellationToken()
+        events = []
+        decoded_count = 0
+
+        def decode_and_cancel(*args):
+            nonlocal decoded_count
+            decoded_count += 1
+            record = decode_line(*args)
+            if decoded_count == 3:
+                token.cancel()
+            return record
+
+        with patch('proto_tool.ble_service.time.monotonic', return_value=0), \
+                patch('proto_tool.ble_service.decode_line', side_effect=decode_and_cancel), \
+                self.assertRaises(Cancelled):
+            decode_logs(self.request(), event=lambda **fields: events.append(fields), cancellation=token)
+        self.assertEqual(decoded_count, 3)
+        self.assertEqual([fields['processed'] for fields in events if fields['stage'] == 'decoding'], [1])
+        self.assertNotIn('exporting', [fields['stage'] for fields in events])
         self.assertEqual(list(self.output.iterdir()), [])
 
     def test_empty_encoding_and_oversize_fail_without_output(self):

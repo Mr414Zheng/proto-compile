@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Combine
 import Darwin
 
 @main
@@ -16,7 +17,8 @@ struct BleLogModelTests {
         let slow = (request["log_path"] as! String).contains("slow")
         if slow { signal(SIGTERM, SIG_IGN) }
         let event: [String: Any] = ["protocol_version": 1, "task_id": request["task_id"]!, "type": "event", "stage": "decoding", "message_zh": "正在逐条解码", "processed": 2]
-        FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: event) + Data([10]))
+        let eventLine = try JSONSerialization.data(withJSONObject: event) + Data([10])
+        FileHandle.standardOutput.write(eventLine + eventLine)
         Thread.sleep(forTimeInterval: slow ? 0.4 : 0.08)
         if slow {
             let cancelled: [String: Any] = ["protocol_version": 1, "task_id": request["task_id"]!, "type": "error", "code": "CANCELLED", "message_zh": "解析已取消", "suggestion": "可重新选择日志后重试。"]
@@ -89,8 +91,16 @@ struct BleLogModelTests {
         precondition(jsonRequest["log_format"] as? String == "json")
         model.setLogPath(slowFile.path)
         model.parse()
+        var progressEvents: [BleProgressState] = []
+        var broadModelEvents = 0
+        let progressSubscription = model.progress.$state.dropFirst().sink { progressEvents.append($0) }
+        let modelSubscription = model.objectWillChange.sink { broadModelEvents += 1 }
         wait("progress with unknown total", { model.processed == 2 })
         precondition(model.total == nil)
+        precondition(progressEvents == [BleProgressState(stage: "解码蓝牙记录", stageDetail: "正在逐条解码", processed: 2)], "duplicate engine events publish one complete progress state")
+        precondition(broadModelEvents == 0, "engine progress cannot invalidate the input/result model")
+        progressSubscription.cancel()
+        modelSubscription.cancel()
         model.cancel()
         precondition(model.isCancelling && model.isParsing && !model.canParse)
         wait("cancel waits for engine exit", { !model.busy })

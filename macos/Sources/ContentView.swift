@@ -38,7 +38,7 @@ final class ViewOptions: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
-    @ObservedObject private var options = ViewOptions()
+    @StateObject private var options = ViewOptions()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -77,7 +77,6 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 700)
         .disclosureGroupStyle(ClickableDisclosureStyle())
         .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: $model.showAbout) { AboutView(model: model) }
     }
 
     private var header: some View {

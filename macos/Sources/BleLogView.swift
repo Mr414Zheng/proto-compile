@@ -2,40 +2,8 @@ import SwiftUI
 
 @MainActor
 final class BleViewOptions: ObservableObject {
-    @Published var mode = 0
     @Published var errorDetails = false
     @Published var warningsExpanded = false
-    init(mode: Int = 0) { self.mode = mode }
-}
-
-struct WorkspaceView: View {
-    @ObservedObject var model: AppModel
-    @ObservedObject var bleModel: BleLogModel
-    @StateObject private var options: BleViewOptions
-
-    init(model: AppModel, bleModel: BleLogModel, initialMode: Int = 0) {
-        self.model = model
-        self.bleModel = bleModel
-        _options = StateObject(wrappedValue: BleViewOptions(mode: initialMode))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Picker("工作模式", selection: $options.mode) {
-                Text("协议转换").tag(0)
-                Text("蓝牙日志解析").tag(1)
-            }
-            .pickerStyle(.segmented).labelsHidden().accessibilityLabel("工作模式")
-            .padding(.horizontal, 24).padding(.top, 16).padding(.bottom, 8)
-            .disabled(model.isConverting || bleModel.busy)
-            if options.mode == 0 { ContentView(model: model) }
-            else { BleLogView(model: bleModel, version: model.version, build: model.build) }
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: Binding(get: { options.mode == 1 && model.showAbout }, set: { model.showAbout = $0 })) {
-            AboutView(model: model)
-        }
-    }
 }
 
 struct BleLogView: View {
@@ -55,7 +23,7 @@ struct BleLogView: View {
                     selectionSection(title: "3. 选择导出父目录", icon: "folder", path: model.outputParent,
                                      empty: "尚未选择导出位置", hint: "在此目录下创建独立结果文件夹，保存 UTF-8 编码的 .txt 文件。", action: model.chooseOutput)
                     Divider()
-                    statusSection
+                    BleStatusView(model: model, progress: model.progress)
                     if let failure = model.failure { errorSection(failure) }
                     if let result = model.result { resultSection(result) }
                 }.padding(24)
@@ -124,37 +92,6 @@ struct BleLogView: View {
         .disabled(model.busy)
     }
 
-    private var statusSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                if model.busy { ProgressView().controlSize(.small).frame(width: 22) }
-                else {
-                    Image(systemName: model.failure != nil ? "exclamationmark.triangle" : (model.result != nil ? "checkmark.circle" : "info.circle"))
-                        .font(.title3).foregroundColor(model.failure != nil ? .orange : .secondary).accessibilityHidden(true)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.stage).font(.headline)
-                    Text(model.stageDetail).font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 16)
-                if model.isParsing {
-                    Button(model.isCancelling ? "正在取消…" : "取消", action: model.cancel)
-                        .disabled(model.isCancelling).keyboardShortcut(.cancelAction)
-                } else {
-                    Button("开始解析", action: model.parse)
-                        .buttonStyle(.borderedProminent).controlSize(.large)
-                        .disabled(!model.canParse).keyboardShortcut(.defaultAction)
-                }
-            }
-            if model.isParsing, let processed = model.processed {
-                if let total = model.total, total > 0 {
-                    ProgressView(value: Double(min(processed, total)), total: Double(total))
-                    Text("已处理 \(processed) / \(total) 条记录").font(.callout).foregroundColor(.secondary)
-                } else { Text("已处理 \(processed) 条记录").font(.callout).foregroundColor(.secondary) }
-            }
-        }
-    }
-
     private func errorSection(_ failure: EngineFailure) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
@@ -206,4 +143,41 @@ struct BleLogView: View {
             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+private struct BleStatusView: View {
+    @ObservedObject var model: BleLogModel
+    @ObservedObject var progress: BleProgressModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                if model.busy { ProgressView().controlSize(.small).frame(width: 22) }
+                else {
+                    Image(systemName: model.failure != nil ? "exclamationmark.triangle" : (model.result != nil ? "checkmark.circle" : "info.circle"))
+                        .font(.title3).foregroundColor(model.failure != nil ? .orange : .secondary).accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(progress.state.stage).font(.headline)
+                    Text(progress.state.stageDetail).font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 16)
+                if model.isParsing {
+                    Button(model.isCancelling ? "正在取消…" : "取消", action: model.cancel)
+                        .disabled(model.isCancelling).keyboardShortcut(.cancelAction)
+                } else {
+                    Button("开始解析", action: model.parse)
+                        .buttonStyle(.borderedProminent).controlSize(.large)
+                        .disabled(!model.canParse).keyboardShortcut(.defaultAction)
+                }
+            }
+            if model.isParsing, let processed = progress.state.processed {
+                if let total = progress.state.total, total > 0 {
+                    ProgressView(value: Double(min(processed, total)), total: Double(total))
+                    Text("已处理 \(processed) / \(total) 条记录").font(.callout).foregroundColor(.secondary)
+                } else { Text("已处理 \(processed) 条记录").font(.callout).foregroundColor(.secondary) }
+            }
+        }
+    }
+
 }
