@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = AppModel()
+    let bleModel = BleLogModel()
     private var window: NSWindow?
     private var quitting = false
     private var performanceDriver: PerformanceDriver?
@@ -36,7 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 800), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Proto Compile"
         window.minSize = NSSize(width: 760, height: 740)
-        window.contentView = NSHostingView(rootView: ContentView(model: model))
+        let previewBLE = CommandLine.arguments.contains("--render-preview") && ProcessInfo.processInfo.environment["PROTO_COMPILE_PREVIEW_WORKFLOW"] == "ble"
+        window.contentView = NSHostingView(rootView: WorkspaceView(model: model, bleModel: bleModel, initialMode: previewBLE ? 1 : 0))
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -70,7 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if model.isConverting || model.isInspecting {
+        if model.isConverting || model.isInspecting || bleModel.busy {
             NSApp.terminate(nil)
             return false
         }
@@ -80,7 +82,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !quitting else { return .terminateLater }
         quitting = true
-        model.shutdown { DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) } }
+        var remaining = 2
+        let finished = {
+            remaining -= 1
+            if remaining == 0 { DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) } }
+        }
+        model.shutdown(finished)
+        bleModel.shutdown(finished)
         return .terminateLater
     }
 
@@ -197,9 +205,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    func bleIntegrationTest(html: String, log: String, format: String, outputParent: String) {
+        guard let selectedFormat = BleLogModel.LogFormat(rawValue: format) else {
+            fputs("日志格式无效，请使用 frames 或 json。\n", stderr)
+            exit(2)
+        }
+        bleModel.setFormat(selectedFormat)
+        bleModel.setLogPath(log)
+        bleModel.setProtocolPath(html)
+        bleModel.setOutputParent(outputParent)
+        bleModel.parse()
+        let started = Date()
+        var finishing = false
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [self] timer in
+            Task { @MainActor in
+                guard !finishing else { return }
+                @MainActor func stop(_ code: Int32, _ message: String) {
+                    finishing = true
+                    timer.invalidate()
+                    if code == 0 { print(message) }
+                    else { fputs("蓝牙日志集成测试失败：\(message)\n", stderr) }
+                    bleModel.shutdown { exit(code) }
+                }
+                if Date().timeIntervalSince(started) > 120 {
+                    stop(1, "120 秒内未完成解析，正在停止引擎。")
+                } else if let failure = bleModel.failure {
+                    stop(1, "\(failure.title)\n\(failure.suggestion)\n\(failure.details)")
+                } else if !bleModel.isParsing, let result = bleModel.result {
+                    guard let path = result.report_path, let output = result.output_path,
+                          let count = result.record_count, let decoded = result.decoded_count,
+                          let warnings = result.warning_count, let errors = result.error_count,
+                          count == decoded + warnings + errors,
+                          FileManager.default.fileExists(atPath: path) else {
+                        stop(1, "结果文件缺失或记录计数不一致。")
+                        return
+                    }
+                    do {
+                        let summary: [String: Any] = ["output_path": output, "report_path": path, "record_count": count,
+                                                      "decoded_count": decoded, "warning_count": warnings, "error_count": errors]
+                        let json = try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys])
+                        stop(0, String(decoding: json, as: UTF8.self))
+                    } catch { stop(1, "无法生成结果摘要：\(error.localizedDescription)") }
+                }
+            }
+        }
+    }
+
     private func renderPreview(to path: String) {
         let environment = ProcessInfo.processInfo.environment
         model.preview(environment["PROTO_COMPILE_PREVIEW_STATE"] ?? "empty")
+        if environment["PROTO_COMPILE_PREVIEW_WORKFLOW"] == "ble" {
+            bleModel.preview(environment["PROTO_COMPILE_PREVIEW_STATE"] ?? "idle")
+        }
         let appearance = environment["PROTO_COMPILE_PREVIEW_THEME"] == "dark" ? NSAppearance.Name.darkAqua : .aqua
         NSApp.appearance = NSAppearance(named: appearance)
         let window = makeWindow()
@@ -223,6 +280,15 @@ struct ProtoCompileApplication {
         PerformanceDriver.markLaunchIfRequested()
         let delegate = AppDelegate()
         if CommandLine.arguments.contains("--smoke-test") { delegate.smokeTest(); return }
+        if let index = CommandLine.arguments.firstIndex(of: "--ble-integration-test") {
+            guard CommandLine.arguments.count == index + 5 else {
+                fputs("用法：--ble-integration-test <协议 HTML> <日志文件> <frames|json> <导出父目录>\n", stderr)
+                exit(2)
+            }
+            delegate.bleIntegrationTest(html: CommandLine.arguments[index + 1], log: CommandLine.arguments[index + 2], format: CommandLine.arguments[index + 3], outputParent: CommandLine.arguments[index + 4])
+            withExtendedLifetime(delegate) { RunLoop.main.run() }
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--integration-test") {
             guard (index + 3...index + 5).contains(CommandLine.arguments.count) else {
                 fputs("Usage: --integration-test <html> <outputParent> [3.25.9|3.6.1] [java|objc]\n", stderr)

@@ -4,7 +4,7 @@
 
 Proto Compile 提供原生 SwiftUI 桌面应用与 Python 命令行工具，支持协议提取、依赖解析、输入检查和代码生成。协议内容在本机处理，无需上传到服务器。
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.4.0-blue)
 ![Platform](https://img.shields.io/badge/macOS-13.0%2B-black)
 ![Architecture](https://img.shields.io/badge/architecture-arm64%20%7C%20x86__64-lightgrey)
 ![Output](https://img.shields.io/badge/output-Java%20%7C%20Objective--C-orange)
@@ -19,12 +19,13 @@ Proto Compile 提供原生 SwiftUI 桌面应用与 Python 命令行工具，支�
 - **转换前检查**：解析依赖，报告排除项、警告、语法错误及生成符号冲突。
 - **独立结果目录**：桌面应用每次转换创建新目录；转换成功后才发布结果，支持取消任务。
 - **自包含 macOS 应用**：分别提供 Apple Silicon 和 Intel 构建，内置 Python 与 protoc。
+- **蓝牙日志解析**：选择 device protocol HTML 文档，解析完整 BLE 帧或格式化 JSON payload 日志，按条导出可读 TXT。
 
 ## 兼容性
 
 | 项目 | 说明 |
 | --- | --- |
-| 当前版本 | 1.3.0（构建号 5） |
+| 当前版本 | 1.4.0（构建号 6） |
 | 桌面应用 | macOS 13.0 及以上 |
 | CPU 架构 | Apple Silicon（arm64）、Intel（x86_64），分别构建 |
 | 命令行 | Python 3.9+；自动工具链准备仅支持 macOS |
@@ -42,8 +43,8 @@ Java 输出使用完整运行库，不是 Lite。生成代码应搭配所选模�
 
 | Mac 类型 | 安装包 |
 | --- | --- |
-| Apple Silicon（M 系列） | `Proto-Compile-1.3.0-arm64.zip` |
-| Intel | `Proto-Compile-1.3.0-x86_64.zip` |
+| Apple Silicon（M 系列） | `Proto-Compile-1.4.0-arm64.zip` |
+| Intel | `Proto-Compile-1.4.0-x86_64.zip` |
 
 解压后，将 **Proto Compile.app** 移入“应用程序”目录。匹配架构的应用无需另装 Python、JDK、protoc 或 Rosetta。
 
@@ -76,6 +77,29 @@ Objective-C 文件数量包含头文件和实现文件。预检缓存、描述�
 当前构建采用 **ad-hoc 签名，尚未进行 Developer ID 签名及 Apple 公证**。若 macOS 阻止打开，请先确认安装包来源可信，再按照系统设置中的 **隐私与安全性 → 仍要打开** 流程处理。无需关闭系统安全保护。
 
 参见 [Apple：打开未经过公证的 Mac 应用](https://support.apple.com/zh-cn/102445)。
+
+## 蓝牙日志解析
+
+在应用顶部选择“蓝牙日志解析”，导入设备实际使用的 device protocol HTML 文档，再选择日志类型和日志文件。选择导出父目录后点击“开始解析”。每次操作创建独立的结果目录，成功后可打开 TXT 或在 Finder 中查看；取消或文件级错误不会发布半成品。
+
+完整 BLE 帧文件为 UTF-8 纯文本，一行一帧，不带时间、方向、空格或 `0x` 前缀，例如：
+
+```text
+44540F0098E1FFFF0D14000000152D0000001D88130000
+445402009E1E01005001
+```
+
+格式化 JSON 日志为一行一条记录，可包含原始时间：
+
+```text
+2026-10-27 10:43:05:{"id":"1","name":"up","sentence":"0801"}
+```
+
+`id` 是十进制操作码，`name` 为 `up`（设备上报）或 `down`（App 下发），`sentence` 为十六进制 payload。解析完整帧时检查前缀、长度和 CRC；仅有 payload 时不做帧级 CRC 校验。
+
+每条 TXT 记录只包含“原始十六进制字符串”和“结构体”。结构体具有 `timestamp`、`opcode`、`direction`、`message` 和 `data`，不包含 `raw_timestamp`。协议字段名、嵌套结构、枚举名和实际字段存在性予以保留；字节串显示为十六进制。纯帧没有时间和方向，解析器会在可判断时标注推断依据；无法区分方向或消息时保留候选，不编造结果。
+
+协议文件沿用应用支持的 TiddlyWiki `$(FILE)` 声明格式，并通过 `Content` 中的 `OPT_xxxx` 主链接与 device protocol 消息角色约定建立映射。字段定义来自本次选择的文档；不支持或缺失的根消息映射、未知字段、坏帧和截断数据会在结果中保留并标注。界面展示正常、提示和错误记录的数量，存在坏记录也可导出其诊断；未编码的新版字段不自动视为旧设备错误。日志需为 UTF-8，单行最多 8 MiB，payload 解码及嵌套深度另有安全限制，超限会给出中文提示。
 
 ## 命令行
 
@@ -231,8 +255,8 @@ Intel 使用 `--arch x86_64`。构建产物位于：
 dist/
 ├── arm64/Proto Compile.app
 ├── x86_64/Proto Compile.app
-├── Proto-Compile-1.3.0-arm64.zip
-└── Proto-Compile-1.3.0-x86_64.zip
+├── Proto-Compile-1.4.0-arm64.zip
+└── Proto-Compile-1.4.0-x86_64.zip
 ```
 
 构建工具将 Python、工具链和缓存放在 `.tools/`，不安装到系统目录，也不修改系统 PATH。依赖版本见 [`scripts/build-requirements.txt`](scripts/build-requirements.txt)，下载文件使用固定摘要校验。桌面应用构建需要备齐两个运行库目标。

@@ -14,6 +14,8 @@ struct EngineRequest: Encodable {
     var output_language: String = "java"
     var preparation_output: String? = nil
     var preparation_path: String? = nil
+    var log_path: String? = nil
+    var log_format: String? = nil
 }
 
 struct EngineMessage: Decodable {
@@ -25,6 +27,11 @@ struct EngineMessage: Decodable {
     var processed: Int?
     var total: Int?
     var output_path: String?
+    var report_path: String?
+    var record_count: Int?
+    var decoded_count: Int?
+    var warning_count: Int?
+    var error_count: Int?
     var proto_count: Int?
     var java_count: Int?
     var output_language: String?

@@ -77,7 +77,7 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 700)
         .disclosureGroupStyle(ClickableDisclosureStyle())
         .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: $model.showAbout) { aboutView }
+        .sheet(isPresented: $model.showAbout) { AboutView(model: model) }
     }
 
     private var header: some View {
@@ -318,14 +318,19 @@ struct ContentView: View {
         }.padding(.top, 8).frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var aboutView: some View {
+}
+
+struct AboutView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
         VStack(spacing: 14) {
             Image(systemName: "curlybraces.square.fill").font(.system(size: 56)).foregroundColor(.accentColor).accessibilityHidden(true)
             Text("Proto Compile").font(.title2.weight(.semibold))
             Text("版本 \(model.version) (\(model.build))")
             Text("当前目标：\(model.outputLanguage.runtimeName) \(model.targetRuntime.rawValue)")
             Text("内置 protoc：\(model.compilerVersion)").textSelection(.enabled)
-            Text("将 HTML 协议文档与 Proto 文件转换为 Java 或 Objective-C 源码。\n所有转换均在本机完成。")
+            Text("将协议文档与 Proto 文件转换为 Java 或 Objective-C 源码，\n或按设备协议解析蓝牙日志。所有处理均在本机完成。")
                 .multilineTextAlignment(.center).foregroundColor(.secondary)
             Button("完成") { model.showAbout = false }.keyboardShortcut(.defaultAction)
         }.padding(32).frame(width: 400)

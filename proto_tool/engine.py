@@ -21,8 +21,23 @@ def parse_request(data):
         raise ConversionError('进程协议版本不受支持，请更新应用。', 'UNSUPPORTED_PROTOCOL')
     if not isinstance(data.get('task_id'), str) or not data['task_id'].strip():
         raise ConversionError('请求缺少有效任务编号。', 'INVALID_REQUEST')
-    if data.get('action') not in ('inspect', 'convert', 'version'):
+    if data.get('action') not in ('inspect', 'convert', 'version', 'decode_ble'):
         raise ConversionError('请求操作无效。', 'INVALID_REQUEST')
+    if data['action'] == 'decode_ble':
+        from .ble_service import BleDecodeRequest, LOG_FORMATS
+        paths = data.get('input_paths')
+        if data.get('input_kind') != 'html' or not isinstance(paths, list) or len(paths) != 1 or not isinstance(paths[0], str) or not Path(paths[0]).is_absolute():
+            raise ConversionError('蓝牙解析需要选择一个 HTML 协议文档。', 'INVALID_REQUEST')
+        if data.get('include_paths', []) != []:
+            raise ConversionError('蓝牙解析从所选协议文档读取定义，不接受额外依赖目录。', 'INVALID_REQUEST')
+        for key, label in (('log_path', '蓝牙日志文件'), ('output_parent', '导出目录')):
+            if not isinstance(data.get(key), str) or not Path(data[key]).is_absolute():
+                raise ConversionError(f'请选择有效的{label}。', 'INVALID_REQUEST')
+        if data.get('log_format') not in LOG_FORMATS:
+            raise ConversionError('日志类型必须为完整 BLE 帧或格式化 JSON 日志。', 'INVALID_REQUEST')
+        if data.get('preparation_path') is not None or data.get('preparation_output') is not None:
+            raise ConversionError('蓝牙日志解析不能使用代码转换预检缓存。', 'INVALID_REQUEST')
+        return BleDecodeRequest(paths[0], data['log_path'], data['log_format'], data['output_parent'])
     if data.get('input_kind') not in ('html', 'proto'):
         raise ConversionError('输入类型必须为 HTML 或 proto。', 'INVALID_REQUEST')
     for key in ('input_paths', 'include_paths'):
@@ -87,7 +102,11 @@ def main(stdin=None, stdout=None):
         if isinstance(data, dict) and isinstance(data.get('task_id'), str):
             task_id = data['task_id']
         request = parse_request(data)
-        result = convert(request, event=lambda **fields: emit('event', **fields), cancellation=token)
+        if data['action'] == 'decode_ble':
+            from .ble_service import decode_logs
+            result = decode_logs(request, event=lambda **fields: emit('event', **fields), cancellation=token)
+        else:
+            result = convert(request, event=lambda **fields: emit('event', **fields), cancellation=token)
         emit('result', **asdict(result))
         return 0
     except Exception as exc:
